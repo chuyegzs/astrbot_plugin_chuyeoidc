@@ -1,0 +1,28 @@
+{
+  "web_username": {
+    "description": "Web管理后台用户名",
+    "type": "string",
+    "hint": "用于登录Web管理后台的用户名",
+    "default": "yeoidc"
+  },
+  "web_password": {
+    "description": "Web管理后台密码",
+    "type": "string",
+    "hint": "用于登录Web管理后台的密码，请修改默认密码以确保安全",
+    "default": "yeoidc"
+  },
+  "web_port": {
+    "description": "Web服务端口",
+    "type": "int",
+    "hint": "Web服务和OIDC服务监听端口，默认33145",
+    "default": 33145,
+    "minimum": 1024,
+    "maximum": 65535
+  },
+  "secure_path": {
+    "description": "安全入口路径",
+    "type": "string",
+    "hint": "Web管理后台的安全入口路径，不能为空，访问地址为 http://ip:端口/{安全入口}",
+    "default": "chuyeoidc"
+  }
+}
