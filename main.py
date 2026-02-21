@@ -4,10 +4,11 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.3
+版本: v1.0.4
 """
 
 import asyncio
+import html
 import json
 import os
 import random
@@ -27,6 +28,21 @@ from aiohttp import web
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+
+
+def escape_html(text: str) -> str:
+    """转义 HTML 特殊字符，防止 XSS 攻击
+
+    Args:
+        text: 需要转义的文本
+
+    Returns:
+        转义后的安全文本
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return html.escape(text, quote=False)
+
 
 # 导入模板管理器
 try:
@@ -147,13 +163,15 @@ class AuditLogManager:
             # 将待处理日志添加到主日志列表
             for log_entry in self._pending_logs:
                 self._logs.insert(0, log_entry)
-                self._add_to_index(log_entry, 0)
+
+            # 重建索引（因为使用了 insert(0)，所有索引位置都变了）
+            self._rebuild_index()
 
             # 限制日志数量
             if len(self._logs) > self._max_logs:
                 self._logs[self._max_logs :]
                 self._logs = self._logs[: self._max_logs]
-                # 重建索引（因为删除了日志）
+                # 再次重建索引（因为删除了日志）
                 self._rebuild_index()
 
             # 保存到文件
@@ -249,6 +267,8 @@ class AuditLogManager:
     def clear_logs(self):
         """清空所有日志"""
         self._logs = []
+        self._pending_logs = []
+        self._action_index = {}
         self._save_logs()
 
 
@@ -1283,13 +1303,15 @@ class OIDCServer:
         logger.info(f"exchange_code: client_id={client_id}")
         async with self._lock:
             session = None
+            session_id = None
             # 遍历所有会话查找匹配的 auth_code
-            for session_id, session_data in self.sessions.items():
+            for sid, session_data in self.sessions.items():
                 # 使用 auth_code（高熵授权码）而不是 code（验证码）
                 if session_data.get("auth_code") == code and session_data.get(
                     "verified"
                 ):
                     session = self._dict_to_session(session_data)
+                    session_id = sid
                     break
 
             if not session:
@@ -1301,6 +1323,9 @@ class OIDCServer:
                     f"client_id不匹配: expected={session.client_id[:8] if session.client_id else 'any'}..., got={client_id[:8]}..."
                 )
                 return None
+
+            # 防止授权码重放：立即删除会话，使授权码失效
+            self.session_manager.delete_session(session_id)
 
             access_token = self._generate_token()
             refresh_token = self._generate_token()
@@ -1406,7 +1431,14 @@ class OIDCServer:
             return new_token_data
 
     async def get_user_info(self, token: str) -> dict | None:
-        return self.session_manager.get_access_token(token)
+        token_data = self.session_manager.get_access_token(token)
+        if not token_data:
+            return None
+        # 拒绝 refresh_token，只允许 access_token 获取用户信息
+        if token_data.get("type") == "refresh_token":
+            logger.warning("拒绝使用 refresh_token 获取用户信息")
+            return None
+        return token_data
 
     async def cleanup_expired(self):
         expire_seconds = self._get_web_config("code_expire_seconds", 300)
@@ -1424,17 +1456,31 @@ class OIDCServer:
                 if vc and vc.get("session_id"):
                     self.session_manager.delete_session(vc["session_id"])
 
-            expired_tokens = [
-                token
-                for token, data in self.access_tokens.items()
-                if current_time - data.get("created_at", current_time) > 3600
-            ]
-            for token in expired_tokens:
+            # 区分 access_token 和 refresh_token 的过期时间
+            # access_token: 3600 秒（1 小时）
+            # refresh_token: 30 天（2592000 秒）
+            expired_access_tokens = []
+            expired_refresh_tokens = []
+            for token, data in self.access_tokens.items():
+                token_type = data.get("type", "access_token")
+                created_at = data.get("created_at", current_time)
+                if token_type == "refresh_token":
+                    # refresh_token 有效期 30 天
+                    if current_time - created_at > 2592000:
+                        expired_refresh_tokens.append(token)
+                else:
+                    # access_token 有效期 1 小时
+                    if current_time - created_at > 3600:
+                        expired_access_tokens.append(token)
+
+            for token in expired_access_tokens:
+                self.session_manager.delete_access_token(token)
+            for token in expired_refresh_tokens:
                 self.session_manager.delete_access_token(token)
 
-        if expired_codes or expired_tokens:
+        if expired_codes or expired_access_tokens or expired_refresh_tokens:
             logger.debug(
-                f"清理过期数据: {len(expired_codes)} 个验证码, {len(expired_tokens)} 个令牌"
+                f"清理过期数据: {len(expired_codes)} 个验证码, {len(expired_access_tokens)} 个 access_token, {len(expired_refresh_tokens)} 个 refresh_token"
             )
 
         # 保存清理后的数据
@@ -1652,15 +1698,23 @@ class WebHandler:
         """获取允许的 CORS 域名列表"""
         origins = []
         for client_data in self.client_manager.get_all_clients().values():
-            redirect_url = client_data.get("redirect_url", "")
-            if redirect_url:
-                try:
-                    parsed = urlparse(redirect_url)
-                    origin = f"{parsed.scheme}://{parsed.netloc}"
-                    if origin not in origins:
-                        origins.append(origin)
-                except Exception:
-                    pass
+            # 优先使用 redirect_urls（新字段），兼容 redirect_url（旧字段）
+            redirect_urls = client_data.get("redirect_urls", [])
+            if not redirect_urls:
+                # 兼容旧数据，使用单个 redirect_url
+                redirect_url = client_data.get("redirect_url", "")
+                if redirect_url:
+                    redirect_urls = [redirect_url]
+
+            for redirect_url in redirect_urls:
+                if redirect_url:
+                    try:
+                        parsed = urlparse(redirect_url)
+                        origin = f"{parsed.scheme}://{parsed.netloc}"
+                        if origin not in origins:
+                            origins.append(origin)
+                    except Exception:
+                        pass
         return origins
 
     def _set_cors_headers(self, response: web.Response, request: web.Request):
@@ -2424,7 +2478,7 @@ class WebHandler:
             "jwks_uri": f"{base_url}/.well-known/jwks.json",
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["HS256"],
+            "id_token_signing_alg_values_supported": ["RS256"],
             "scopes_supported": ["openid", "profile", "email"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": [
@@ -2485,7 +2539,25 @@ class WebHandler:
                 session = await self.oidc_server.get_session(result)
                 if session:
                     # 使用 auth_code（高熵授权码）而不是 code（验证码）
-                    redirect_url = f"{session.redirect_uri}?code={session.auth_code}&state={session.state}"
+                    # 正确处理 redirect_uri，避免覆盖原有查询参数
+                    parsed = urlparse(session.redirect_uri)
+                    query_params = {}
+                    if parsed.query:
+                        for param in parsed.query.split("&"):
+                            if "=" in param:
+                                key, value = param.split("=", 1)
+                                query_params[key] = value
+
+                    # 添加 code 和 state 参数
+                    query_params["code"] = session.auth_code
+                    query_params["state"] = session.state
+
+                    # 重建 URL
+                    new_query = "&".join([f"{k}={v}" for k, v in query_params.items()])
+                    redirect_url = (
+                        f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
+                    )
+
                     return web.json_response(
                         {
                             "success": True,
@@ -3745,8 +3817,8 @@ class WebHandler:
                         </svg>
                     </div>
                     <div>
-                        <p class="text-sm font-bold text-slate-700">{scope_descriptions[s]["name"]}</p>
-                        <p class="text-xs text-slate-500 mt-0.5">{scope_descriptions[s]["desc"]}</p>
+                        <p class="text-sm font-bold text-slate-700">{escape_html(scope_descriptions[s]["name"])}</p>
+                        <p class="text-xs text-slate-500 mt-0.5">{escape_html(scope_descriptions[s]["desc"])}</p>
                     </div>
                 </div>"""
 
@@ -3763,7 +3835,7 @@ class WebHandler:
                     </div>
                     <div>
                         <p class="text-xs font-bold text-primary uppercase tracking-wider mb-1">发送到群聊</p>
-                        <p class="text-sm font-medium text-slate-700">{", ".join(groups)}</p>
+                        <p class="text-sm font-medium text-slate-700">{escape_html(", ".join(groups))}</p>
                     </div>
                 </div>"""
 
@@ -3784,7 +3856,7 @@ class WebHandler:
 
         # 生成验证码 HTML
         code_chars_html = " ".join(
-            [f'<span class="code-char">{char}</span>' for char in code]
+            [f'<span class="code-char">{escape_html(char)}</span>' for char in code]
         )
 
         # 从模板文件加载
@@ -3793,16 +3865,16 @@ class WebHandler:
 
             template = template_manager.get_template("verify")
             return template.format(
-                theme_color=theme_color,
+                theme_color=escape_html(theme_color),
                 icon_html=icon_html,
-                favicon_url=favicon_url,
-                code=code,
+                favicon_url=escape_html(favicon_url),
+                code=escape_html(code),
                 code_chars_html=code_chars_html,
-                session_id=session_id,
-                auth_code=auth_code,
-                redirect_uri=redirect_uri,
-                state=state,
-                client_name=client_name,
+                session_id=escape_html(session_id),
+                auth_code=escape_html(auth_code),
+                redirect_uri=escape_html(redirect_uri),
+                state=escape_html(state),
+                client_name=escape_html(client_name),
                 scope_items=scope_items,
                 group_info=group_info,
                 private_info=private_info,
@@ -3898,10 +3970,10 @@ class WebHandler:
 
             template = template_manager.get_template("verify_input")
             return template.format(
-                theme_color=theme_color,
+                theme_color=escape_html(theme_color),
                 icon_html=icon_html,
-                favicon_url=favicon_url,
-                code=code,
+                favicon_url=escape_html(favicon_url),
+                code=escape_html(code),
                 poll_interval_ms=poll_interval_ms,
             )
         except Exception as e:
