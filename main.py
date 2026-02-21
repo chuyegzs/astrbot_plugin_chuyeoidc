@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.4
+版本: v1.0.5
 """
 
 import asyncio
@@ -27,11 +27,11 @@ from aiohttp import web
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 
 def escape_html(text: str) -> str:
-    """转义 HTML 特殊字符，防止 XSS 攻击
+    """转义 HTML 特殊字符，防止 XSS 攻击（用于 HTML 内容）
 
     Args:
         text: 需要转义的文本
@@ -42,6 +42,82 @@ def escape_html(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
     return html.escape(text, quote=False)
+
+
+def escape_html_attr(text: str) -> str:
+    """转义 HTML 属性值，防止 XSS 攻击（用于 HTML 属性）
+
+    Args:
+        text: 需要转义的文本
+
+    Returns:
+        转义后的安全文本
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return html.escape(text, quote=True)
+
+
+def escape_js_string(text: str) -> str:
+    """转义 JavaScript 字符串，防止 XSS 攻击（用于 JS 字符串）
+
+    Args:
+        text: 需要转义的文本
+
+    Returns:
+        转义后的安全文本
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # 转义 JS 字符串中的特殊字符
+    text = text.replace("\\", "\\\\")
+    text = text.replace("'", "\\'")
+    text = text.replace('"', '\\"')
+    text = text.replace("\n", "\\n")
+    text = text.replace("\r", "\\r")
+    text = text.replace("\t", "\\t")
+    return text
+
+
+def escape_css_value(text: str) -> str:
+    """转义 CSS 值，防止 XSS 攻击（用于 CSS 值）
+
+    Args:
+        text: 需要转义的文本
+
+    Returns:
+        转义后的安全文本
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # 移除 CSS 中的危险字符
+    text = text.replace(";", "")
+    text = text.replace("{", "")
+    text = text.replace("}", "")
+    text = text.replace("(", "")
+    text = text.replace(")", "")
+    text = text.replace("'", "")
+    text = text.replace('"', "")
+    return text
+
+
+def validate_host_header(host: str) -> bool:
+    """验证 Host header 是否合法，防止 Host Header 污染攻击
+
+    Args:
+        host: 请求的 Host header
+
+    Returns:
+        是否合法
+    """
+    if not host:
+        return False
+    # 只允许字母、数字、点、连字符和冒号（用于端口）
+    # 格式：domain.com 或 domain.com:port
+    import re
+
+    pattern = r"^[a-zA-Z0-9.-]+(:\d+)?$"
+    return bool(re.match(pattern, host))
 
 
 # 导入模板管理器
@@ -377,7 +453,8 @@ class KeyManager:
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
 
-        key_id = f"key_{int(time.time())}"
+        # 使用纳秒级时间戳 + 随机数避免冲突
+        key_id = f"key_{int(time.time_ns())}_{secrets.token_hex(4)}"
         logger.info(f"生成新的 RSA 密钥对: {key_id}")
 
         # 生成密钥
@@ -806,9 +883,9 @@ class ConfigManager:
     def __init__(self, plugin):
         self.plugin = plugin
         # 数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失
-        self.data_dir = os.path.join(os.getcwd(), "data", "chuyeoidc")
+        self.data_dir = StarTools.get_data_dir() / "chuyeoidc"
         os.makedirs(self.data_dir, exist_ok=True)
-        self.config_file = os.path.join(self.data_dir, "web_config.json")
+        self.config_file = self.data_dir / "web_config.json"
         self._web_config: dict = {}
         self._load_config()
 
@@ -869,9 +946,9 @@ class ClientManager:
 
     def __init__(self):
         # 数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失
-        self.data_dir = os.path.join(os.getcwd(), "data", "chuyeoidc")
+        self.data_dir = StarTools.get_data_dir() / "chuyeoidc"
         os.makedirs(self.data_dir, exist_ok=True)
-        self.clients_file = os.path.join(self.data_dir, "clients.json")
+        self.clients_file = self.data_dir / "clients.json"
         self._clients: dict[str, dict] = {}
         self._load_clients()
 
@@ -1016,6 +1093,16 @@ class OIDCServer:
         # 启动自动保存任务
         self._save_task: asyncio.Task | None = None
         self._start_auto_save()
+        # 存储实际的 issuer（从 discovery 请求中获取）
+        self._issuer: str = "https://chuyeoidc.astrbot"
+
+    def set_issuer(self, issuer: str):
+        """设置实际的 issuer（从 discovery 请求中获取）"""
+        self._issuer = issuer
+
+    def get_issuer(self) -> str:
+        """获取当前的 issuer"""
+        return self._issuer
 
     def _get_rsa_private_key_pem(self) -> str:
         """获取 RSA 私钥 PEM 格式（用于 JWT 签名）"""
@@ -1148,7 +1235,7 @@ class OIDCServer:
         expires = now.timestamp() + 3600  # 1小时过期
 
         payload = {
-            "iss": "https://chuyeoidc.astrbot",
+            "iss": self._issuer,
             "sub": session.verified_user_id or "",
             "aud": session.client_id or "",
             "exp": expires,
@@ -1299,8 +1386,12 @@ class OIDCServer:
             return self._dict_to_session(session_data)
         return None
 
-    async def exchange_code(self, code: str, client_id: str = "") -> dict | None:
-        logger.info(f"exchange_code: client_id={client_id}")
+    async def exchange_code(
+        self, code: str, client_id: str = "", redirect_uri: str = ""
+    ) -> dict | None:
+        logger.info(
+            f"exchange_code: client_id={client_id}, redirect_uri={redirect_uri}"
+        )
         async with self._lock:
             session = None
             session_id = None
@@ -1321,6 +1412,13 @@ class OIDCServer:
             if client_id and session.client_id and session.client_id != client_id:
                 logger.warning(
                     f"client_id不匹配: expected={session.client_id[:8] if session.client_id else 'any'}..., got={client_id[:8]}..."
+                )
+                return None
+
+            # 验证 redirect_uri 是否与授权时一致（OIDC 安全要求）
+            if redirect_uri and session.redirect_uri != redirect_uri:
+                logger.warning(
+                    f"redirect_uri不匹配: expected={session.redirect_uri}, got={redirect_uri}"
                 )
                 return None
 
@@ -1524,7 +1622,7 @@ class RateLimiter:
         return identifier
 
     async def check_rate_limit(self, identifier: str, ip: str = "") -> tuple[bool, str]:
-        """检查是否超出速率限制
+        """检查是否超出速率限制（已废弃，使用 check_and_record_limit 代替）
 
         Args:
             identifier: 用户标识（如用户名）
@@ -1581,12 +1679,75 @@ class RateLimiter:
             return True, ""
 
     async def record_attempt(self, identifier: str, ip: str = ""):
-        """记录一次尝试"""
+        """记录一次尝试（已废弃，使用 check_and_record_limit 代替）"""
         async with self._lock:
             key = self._get_key(identifier, ip)
             if key not in self._attempts:
                 self._attempts[key] = []
             self._attempts[key].append(time.time())
+
+    async def check_and_record_limit(
+        self, identifier: str, ip: str = ""
+    ) -> tuple[bool, str]:
+        """原子性地检查速率限制并记录尝试
+
+        防止并发竞争窗口，确保检查和记录是原子操作。
+
+        Args:
+            identifier: 用户标识（如用户名）
+            ip: IP地址
+
+        Returns:
+            (是否允许, 错误信息)
+        """
+        async with self._lock:
+            key = self._get_key(identifier, ip)
+            current_time = time.time()
+
+            # 检查是否处于锁定状态
+            if key in self._lockouts:
+                lockout_end = self._lockouts[key]
+                if current_time < lockout_end:
+                    remaining = int(lockout_end - current_time)
+                    return False, f"登录尝试次数过多，请 {remaining // 60} 分钟后再试"
+                else:
+                    # 锁定已过期，清除记录
+                    del self._lockouts[key]
+                    if key in self._attempts:
+                        del self._attempts[key]
+
+            # 清理过期的尝试记录
+            if key in self._attempts:
+                self._attempts[key] = [
+                    t
+                    for t in self._attempts[key]
+                    if current_time - t < self.window_size
+                ]
+            else:
+                self._attempts[key] = []
+
+            # 检查尝试次数
+            if len(self._attempts[key]) >= self.max_attempts:
+                # 触发锁定
+                self._lockouts[key] = current_time + self.lockout_duration
+
+                # 调用回调函数记录告警
+                if self.on_rate_limit_triggered:
+                    try:
+                        await self.on_rate_limit_triggered(
+                            identifier, ip, len(self._attempts[key])
+                        )
+                    except Exception as e:
+                        logger.error(f"速率限制告警回调失败: {e}")
+
+                return (
+                    False,
+                    f"登录尝试次数过多，已锁定 {self.lockout_duration // 60} 分钟",
+                )
+
+            # 记录本次尝试（原子操作）
+            self._attempts[key].append(current_time)
+            return True, ""
 
     async def reset_attempts(self, identifier: str, ip: str = ""):
         """重置尝试记录（登录成功时调用）"""
@@ -1661,6 +1822,49 @@ class WebHandler:
             window_size=300,  # 5分钟
             on_rate_limit_triggered=on_rate_limit_triggered,
         )
+
+        # 启动后台清理任务
+        self._cleanup_task: asyncio.Task | None = None
+        self._start_cleanup_task()
+
+    def _start_cleanup_task(self):
+        """启动后台清理任务"""
+
+        async def cleanup_expired_sessions():
+            while True:
+                try:
+                    await asyncio.sleep(3600)  # 每小时清理一次
+                    self._cleanup_expired_sessions()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"清理过期 session 时出错: {e}")
+
+        self._cleanup_task = asyncio.create_task(cleanup_expired_sessions())
+
+    def _cleanup_expired_sessions(self):
+        """清理过期的 session"""
+        current_time = time.time()
+        expired_tokens = []
+        for token, session in self.sessions.items():
+            created_at = session.get("created_at", 0)
+            if current_time - created_at > self.SESSION_EXPIRE_SECONDS:
+                expired_tokens.append(token)
+
+        for token in expired_tokens:
+            del self.sessions[token]
+
+        if expired_tokens:
+            logger.info(f"清理了 {len(expired_tokens)} 个过期 session")
+
+    async def stop_cleanup_task(self):
+        """停止后台清理任务"""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
 
     def _validate_session(self, token: str) -> bool:
         """验证 session 是否有效（未过期）"""
@@ -1832,8 +2036,10 @@ class WebHandler:
             password = data.get("password", "")
             ip = request.remote or ""
 
-            # 检查速率限制
-            allowed, error_msg = await self.rate_limiter.check_rate_limit(username, ip)
+            # 原子性地检查速率限制并记录尝试
+            allowed, error_msg = await self.rate_limiter.check_and_record_limit(
+                username, ip
+            )
             if not allowed:
                 self.audit_log_manager.log(
                     action="LOGIN_RATE_LIMITED",
@@ -1847,7 +2053,6 @@ class WebHandler:
                 )
 
             if self._check_password_default():
-                await self.rate_limiter.record_attempt(username, ip)
                 self.audit_log_manager.log(
                     action="LOGIN_FAILED",
                     details="尝试使用默认密码登录",
@@ -1876,9 +2081,7 @@ class WebHandler:
                 )
                 return web.json_response({"success": True, "token": token})
             else:
-                # 登录失败，记录尝试
-                await self.rate_limiter.record_attempt(username, ip)
-                # 获取剩余尝试次数
+                # 登录失败，获取剩余尝试次数
                 attempts_info = self.rate_limiter.get_attempts_info(username, ip)
                 remaining = max(
                     0, attempts_info["max_attempts"] - attempts_info["attempts_count"]
@@ -2344,6 +2547,8 @@ class WebHandler:
 
         if grant_type == "authorization_code":
             # 使用授权码换取 token
+            redirect_uri = data.get("redirect_uri", "")
+
             if not client_id:
                 return web.json_response(
                     {
@@ -2362,7 +2567,9 @@ class WebHandler:
                     status=401,
                 )
 
-            token_data = await self.oidc_server.exchange_code(code, client_id)
+            token_data = await self.oidc_server.exchange_code(
+                code, client_id, redirect_uri
+            )
 
             if not token_data:
                 return web.json_response({"error": "invalid_grant"}, status=400)
@@ -2468,10 +2675,25 @@ class WebHandler:
 
     async def handle_discovery(self, request: web.Request) -> web.Response:
         host = request.host
-        base_url = f"http://{host}"
+        # 验证 Host header 是否合法，防止 Host Header 污染攻击
+        if not validate_host_header(host):
+            return web.json_response(
+                {
+                    "error": "invalid_request",
+                    "error_description": "Invalid host header",
+                },
+                status=400,
+            )
+
+        # 使用实际请求的协议（http 或 https）
+        scheme = request.scheme
+        base_url = f"{scheme}://{host}"
+
+        # 更新 OIDCServer 的 issuer
+        self.oidc_server.set_issuer(base_url)
 
         discovery = {
-            "issuer": "https://chuyeoidc.astrbot",
+            "issuer": base_url,
             "authorization_endpoint": f"{base_url}/authorize",
             "token_endpoint": f"{base_url}/token",
             "userinfo_endpoint": f"{base_url}/userinfo",
@@ -2552,8 +2774,10 @@ class WebHandler:
                     query_params["code"] = session.auth_code
                     query_params["state"] = session.state
 
-                    # 重建 URL
-                    new_query = "&".join([f"{k}={v}" for k, v in query_params.items()])
+                    # 使用 urlencode 正确编码查询参数
+                    from urllib.parse import urlencode
+
+                    new_query = urlencode(query_params)
                     redirect_url = (
                         f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
                     )
@@ -2779,10 +3003,15 @@ class WebHandler:
         )
 
         icon_html = (
-            f'<img src="{icon_url}" class="h-10 w-10 object-cover rounded-lg" alt="icon">'
+            f'<img src="{escape_html_attr(icon_url)}" class="h-10 w-10 object-cover rounded-lg" alt="icon">'
             if icon_url
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>"""
         )
+
+        # 对 theme_color 进行安全转义
+        theme_color_js = escape_js_string(theme_color)
+        theme_color_css = escape_css_value(theme_color)
+        favicon_url_safe = escape_html_attr(favicon_url)
 
         return rf"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2790,7 +3019,7 @@ class WebHandler:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OIDC登录插件 - 管理后台</title>
-    <link rel="icon" type="image/png" href="{favicon_url}">
+    <link rel="icon" type="image/png" href="{favicon_url_safe}">
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script>
@@ -2798,7 +3027,7 @@ class WebHandler:
             theme: {{
                 extend: {{
                     colors: {{
-                        primary: '{theme_color}',
+                        primary: '{theme_color_js}',
                     }}
                 }}
             }}
@@ -2807,15 +3036,15 @@ class WebHandler:
     <style>
         body {{ font-family: 'Inter', -apple-system, sans-serif; }}
         .glass {{ background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(12px); }}
-        .tab-active {{ color: {theme_color}; border-bottom: 2px solid {theme_color}; }}
+        .tab-active {{ color: {theme_color_css}; border-bottom: 2px solid {theme_color_css}; }}
         .custom-scrollbar::-webkit-scrollbar {{ width: 6px; }}
         .custom-scrollbar::-webkit-scrollbar-track {{ background: transparent; }}
         .custom-scrollbar::-webkit-scrollbar-thumb {{ background: #e2e8f0; border-radius: 10px; }}
-        .bg-primary {{ background-color: {theme_color}; }}
-        .text-primary {{ color: {theme_color}; }}
-        .border-primary {{ border-color: {theme_color}; }}
-        .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color}33; }}
-        .hover\:bg-primary:hover {{ background-color: {theme_color}; }}
+        .bg-primary {{ background-color: {theme_color_css}; }}
+        .text-primary {{ color: {theme_color_css}; }}
+        .border-primary {{ border-color: {theme_color_css}; }}
+        .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color_css}33; }}
+        .hover\:bg-primary:hover {{ background-color: {theme_color_css}; }}
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-indigo-50 via-slate-50 to-slate-50">
@@ -4141,7 +4370,7 @@ class ChuyeOIDCPlugin(Star):
         self.config_manager = ConfigManager(self)
         self.client_manager = ClientManager()
         # 初始化审计日志管理器，使用与配置管理器相同的数据目录
-        data_dir = os.path.join(os.getcwd(), "data", "chuyeoidc")
+        data_dir = StarTools.get_data_dir() / "chuyeoidc"
         self.audit_log_manager = AuditLogManager(data_dir)
         # 初始化 SessionManager 用于会话持久化
         self.session_manager = SessionManager(data_dir)
