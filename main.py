@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.0
+版本: v1.0.2
 """
 
 import asyncio
@@ -1017,9 +1017,9 @@ class WebHandler:
         self, theme_color: str = "#4f46e5", icon_url: str = "", favicon_url: str = ""
     ) -> str:
         icon_html = (
-            f'<img src="{icon_url}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
+            f'<img src="{icon_url}" class="w-16 h-16 object-cover rounded-lg" style="width: 64px; height: 64px; aspect-ratio: 1/1;" alt="icon">'
             if icon_url
-            else """<svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>"""
+            else """<svg xmlns="http://www.w3.org/2000/svg" style="width: 64px; height: 64px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>"""
         )
 
         return f'''<!DOCTYPE html>
@@ -1054,7 +1054,7 @@ class WebHandler:
     <div class="max-w-md w-full">
         <div class="glass rounded-3xl shadow-2xl shadow-primary/30 p-8 md:p-10 border border-white">
             <div class="text-center mb-10">
-                <div class="inline-flex items-center justify-center w-16 h-16 mb-6">
+                <div class="mx-auto mb-6" style="width: 64px; height: 64px;">
                     {icon_html}
                 </div>
                 <h1 class="text-3xl font-bold text-slate-800 tracking-tight">管理后台</h1>
@@ -1958,60 +1958,120 @@ class WebHandler:
         .text-primary {{ color: {theme_color}; }}
         .border-primary {{ border-color: {theme_color}; }}
         .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color}33; }}
+        /* 桌面端左右布局 - 合并为一个框 */
+        @media (min-width: 1024px) {{
+            .desktop-container {{
+                max-width: 800px;
+                width: 100%;
+            }}
+            .desktop-inner {{
+                display: grid;
+                grid-template-columns: 50% 50%;
+                gap: 0;
+            }}
+            .desktop-left, .desktop-right {{
+                width: 100%;
+                box-sizing: border-box;
+            }}
+            .mobile-only {{
+                display: none !important;
+            }}
+        }}
+        /* 移动端单列布局 */
+        @media (max-width: 1023px) {{
+            .desktop-container {{
+                max-width: 28rem;
+                width: 100%;
+            }}
+            .desktop-left {{
+                display: none;
+            }}
+        }}
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 bg-[radial-gradient(circle_at_bottom_right,_var(--tw-gradient-stops))] from-indigo-100 via-slate-50 to-teal-50">
-    <div class="w-full max-w-md mx-auto">
-        <div class="glass rounded-[2.5rem] shadow-2xl shadow-primary/30 p-6 sm:p-8 md:p-10 border border-white text-center">
-            <div class="mb-6">
-                <div class="inline-flex items-center justify-center w-16 h-16 mb-6">
-                    {icon_html}
+    <div class="desktop-container mx-auto">
+        <div class="glass rounded-[2.5rem] shadow-2xl shadow-primary/30 p-6 sm:p-8 md:p-10 border border-white">
+            <!-- 桌面端左右布局 -->
+            <div class="desktop-inner">
+                <!-- 桌面端左侧：应用信息和权限 -->
+                <div class="desktop-left text-left p-6" style="padding-right: 2rem;">
+                    <div class="flex items-center gap-4 mb-8">
+                        <div style="width: 64px; height: 64px; flex-shrink: 0;">
+                            {icon_html}
+                        </div>
+                        <div>
+                            <h1 class="text-2xl font-bold text-slate-800 tracking-tight">授权登录</h1>
+                            <p class="text-slate-500 mt-1 font-medium text-sm"><strong class="text-primary">{client_name}</strong> 请求访问你的账号</p>
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">请求的权限</p>
+                        <div class="space-y-2">
+                            {scope_items}
+                        </div>
+                    </div>
                 </div>
-                <h1 class="text-2xl font-bold text-slate-800 tracking-tight">授权登录</h1>
-                <p class="text-slate-500 mt-1 font-medium text-sm"><strong class="text-primary">{client_name}</strong> 请求访问你的账号</p>
-            </div>
+                
+                <!-- 右侧：验证码和操作 -->
+                <div class="desktop-right text-center" style="padding-left: 2rem;">
+                    <!-- 移动端显示的应用信息 -->
+                    <div class="mobile-only mb-6">
+                        <div class="mx-auto mb-6" style="width: 64px; height: 64px;">
+                            {icon_html}
+                        </div>
+                        <h1 class="text-2xl font-bold text-slate-800 tracking-tight">授权登录</h1>
+                        <p class="text-slate-500 mt-1 font-medium text-sm"><strong class="text-primary">{client_name}</strong> 请求访问你的账号</p>
+                    </div>
 
-            <div class="bg-primary rounded-3xl p-6 mb-6 shadow-xl shadow-primary/30 relative overflow-hidden">
-                <div class="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
-                    <svg width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none">
-                        <path d="M0 100 C 20 0 50 0 100 100 Z" fill="white"></path>
-                    </svg>
+                    <div class="bg-primary rounded-3xl p-6 mb-6 shadow-xl shadow-primary/30 relative overflow-hidden">
+                        <div class="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
+                            <svg width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none">
+                                <path d="M0 100 C 20 0 50 0 100 100 Z" fill="white"></path>
+                            </svg>
+                        </div>
+                        <p class="text-white/70 text-xs font-bold uppercase tracking-[0.2em] mb-3 relative z-10">验证码</p>
+                        <div class="flex justify-center relative z-10">
+                            {" ".join([f'<span class="code-char">{char}</span>' for char in code])}
+                        </div>
+                    </div>
+
+                    <!-- 验证码下方的验证方式说明 -->
+                    <div class="space-y-3 mb-6 text-left">
+                        {group_info}
+                        {private_info}
+                    </div>
+
+                    <!-- 移动端显示的权限 -->
+                    <div class="mobile-only">
+                        <div class="mb-6 text-left">
+                            <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">请求的权限</p>
+                            <div class="space-y-2">
+                                {scope_items}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="status" class="hidden flex items-center justify-center gap-3 py-4 px-6 bg-slate-50 rounded-2xl border border-slate-100 mb-4">
+                        <div class="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
+                        <span class="text-sm font-bold text-slate-500">等待验证中...</span>
+                    </div>
+                    
+                    <div id="successStatus" class="hidden flex items-center justify-center gap-3 py-4 px-6 bg-teal-50 rounded-2xl border border-teal-100 mb-4">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-teal-600" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
+                        </svg>
+                        <span class="text-sm font-bold text-teal-600">验证成功！</span>
+                    </div>
+                    
+                    <button id="confirmBtn" onclick="checkAndRedirect()" class="w-full py-3.5 bg-primary hover:opacity-90 text-white font-bold rounded-2xl shadow-lg shadow-primary/30 transition-all transform hover:scale-[1.02] active:scale-[0.98]">
+                        完成并继续
+                    </button>
+                    
+                    <div class="mt-6 text-rose-500 text-sm font-medium hidden" id="errorMsg"></div>
                 </div>
-                <p class="text-white/70 text-xs font-bold uppercase tracking-[0.2em] mb-3 relative z-10">验证码</p>
-                <div class="flex justify-center relative z-10">
-                    {" ".join([f'<span class="code-char">{char}</span>' for char in code])}
-                </div>
             </div>
-
-            <div class="mb-6 text-left">
-                <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">请求的权限</p>
-                <div class="space-y-2">
-                    {scope_items}
-                </div>
-            </div>
-
-            <div class="space-y-3 mb-6 text-left">
-                {group_info}
-                {private_info}
-            </div>
-
-            <div id="status" class="hidden flex items-center justify-center gap-3 py-4 px-6 bg-slate-50 rounded-2xl border border-slate-100 mb-4">
-                <div class="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
-                <span class="text-sm font-bold text-slate-500">等待验证中...</span>
-            </div>
-            
-            <div id="successStatus" class="hidden flex items-center justify-center gap-3 py-4 px-6 bg-teal-50 rounded-2xl border border-teal-100 mb-4">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-teal-600" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
-                </svg>
-                <span class="text-sm font-bold text-teal-600">验证成功！</span>
-            </div>
-            
-            <button id="confirmBtn" onclick="checkAndRedirect()" class="w-full py-3.5 bg-primary hover:opacity-90 text-white font-bold rounded-2xl shadow-lg shadow-primary/30 transition-all transform hover:scale-[1.02] active:scale-[0.98]">
-                完成并继续
-            </button>
-            
-            <div class="mt-6 text-rose-500 text-sm font-medium hidden" id="errorMsg"></div>
         </div>
         <p class="text-center text-slate-400 text-sm mt-8">Powered by <a href="https://github.com/AstrBotDevs/AstrBot" target="_blank" class="text-primary hover:opacity-80">AstrBot</a> & <a href="https://www.chuyel.cn" target="_blank" class="text-primary hover:opacity-80">初叶🍂竹叶-Furry控</a></p>
     </div>
@@ -2334,7 +2394,7 @@ class WebHandler:
 </html>'''
 
 
-@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.1")
+@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.2")
 class ChuyeOIDCPlugin(Star):
     """OIDC 登录插件主类
 
