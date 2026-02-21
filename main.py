@@ -18,8 +18,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
-from urllib.parse import parse_qs, urlencode, urlparse, urljoin
+from typing import Any
+from urllib.parse import urlparse
 
 import jwt
 from aiohttp import web
@@ -41,7 +41,7 @@ except ImportError:
             template_path = os.path.join(self.templates_dir, f"{template_name}.html")
             if not os.path.exists(template_path):
                 raise FileNotFoundError(f"模板文件不存在: {template_path}")
-            with open(template_path, "r", encoding="utf-8") as f:
+            with open(template_path, encoding="utf-8") as f:
                 return f.read()
 
         def render(self, template_name: str, **kwargs) -> str:
@@ -63,7 +63,7 @@ class AuthSession:
     created_at: float
     client_id: str = ""
     verified: bool = False
-    verified_user_id: Optional[str] = None
+    verified_user_id: str | None = None
     user_info: dict = field(default_factory=dict)
 
 
@@ -104,7 +104,7 @@ class AuditLogManager:
         """加载现有日志"""
         if os.path.exists(self.logs_file):
             try:
-                with open(self.logs_file, "r", encoding="utf-8") as f:
+                with open(self.logs_file, encoding="utf-8") as f:
                     self._logs = json.load(f)
             except Exception as e:
                 logger.error(f"加载审计日志失败: {e}")
@@ -151,7 +151,7 @@ class AuditLogManager:
 
             # 限制日志数量
             if len(self._logs) > self._max_logs:
-                removed = self._logs[self._max_logs :]
+                self._logs[self._max_logs :]
                 self._logs = self._logs[: self._max_logs]
                 # 重建索引（因为删除了日志）
                 self._rebuild_index()
@@ -290,7 +290,7 @@ class KeyManager:
         keys_file = os.path.join(self.data_dir, "keys.json")
         if os.path.exists(keys_file):
             try:
-                with open(keys_file, "r", encoding="utf-8") as f:
+                with open(keys_file, encoding="utf-8") as f:
                     data = json.load(f)
                     self._current_key_id = data.get("current_key_id", "")
                     # 加载密钥元数据
@@ -313,7 +313,7 @@ class KeyManager:
                                     )
                             except Exception as e:
                                 logger.warning(f"检查私钥文件权限失败: {e}")
-                            
+
                             self._keys[key_id] = {
                                 "created_at": key_info.get("created_at", 0),
                                 "is_active": key_info.get("is_active", True),
@@ -353,9 +353,9 @@ class KeyManager:
         Returns:
             新生成的密钥ID
         """
+        from cryptography.hazmat.backends import default_backend
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.hazmat.backends import default_backend
 
         key_id = f"key_{int(time.time())}"
         logger.info(f"生成新的 RSA 密钥对: {key_id}")
@@ -375,7 +375,7 @@ class KeyManager:
         )
         with open(private_key_path, "wb") as f:
             f.write(private_pem)
-        
+
         # 设置私钥文件权限为 0600（仅所有者可读写）
         try:
             os.chmod(private_key_path, 0o600)
@@ -408,8 +408,8 @@ class KeyManager:
         Returns:
             (private_key, public_key) 或 (None, None)
         """
-        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
 
         private_key_path = os.path.join(self.data_dir, f"private_key_{key_id}.pem")
         public_key_path = os.path.join(self.data_dir, f"public_key_{key_id}.pem")
@@ -698,7 +698,7 @@ class SessionManager:
         """加载 JSON 文件"""
         if os.path.exists(filepath):
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
+                with open(filepath, encoding="utf-8") as f:
                     data = json.load(f)
                     return data
             except Exception as e:
@@ -737,7 +737,7 @@ class SessionManager:
             self._save_json(self.access_tokens_file, self._access_tokens)
 
     # 会话操作
-    def get_session(self, session_id: str) -> Optional[dict]:
+    def get_session(self, session_id: str) -> dict | None:
         return self._sessions.get(session_id)
 
     def set_session(self, session_id: str, session_data: dict):
@@ -750,7 +750,7 @@ class SessionManager:
         return self._sessions.copy()
 
     # 验证码操作
-    def get_verify_code(self, code: str) -> Optional[dict]:
+    def get_verify_code(self, code: str) -> dict | None:
         return self._verify_codes.get(code)
 
     def set_verify_code(self, code: str, verify_data: dict):
@@ -763,7 +763,7 @@ class SessionManager:
         return self._verify_codes.copy()
 
     # 访问令牌操作
-    def get_access_token(self, token: str) -> Optional[dict]:
+    def get_access_token(self, token: str) -> dict | None:
         return self._access_tokens.get(token)
 
     def set_access_token(self, token: str, token_data: dict):
@@ -807,7 +807,7 @@ class ConfigManager:
 
         if os.path.exists(self.config_file):
             try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
+                with open(self.config_file, encoding="utf-8") as f:
                     loaded = json.load(f)
                     default_config.update(loaded)
                     logger.info("Web配置加载成功")
@@ -858,7 +858,7 @@ class ClientManager:
     def _load_clients(self):
         if os.path.exists(self.clients_file):
             try:
-                with open(self.clients_file, "r", encoding="utf-8") as f:
+                with open(self.clients_file, encoding="utf-8") as f:
                     self._clients = json.load(f)
                     logger.info(
                         f"OIDC客户端配置加载成功，共 {len(self._clients)} 个客户端"
@@ -878,7 +878,7 @@ class ClientManager:
             logger.error(f"保存OIDC客户端配置失败: {e}")
             return False
 
-    def get_client(self, client_id: str) -> Optional[dict]:
+    def get_client(self, client_id: str) -> dict | None:
         return self._clients.get(client_id)
 
     def verify_client(self, client_id: str, client_secret: str) -> bool:
@@ -981,9 +981,9 @@ class OIDCServer:
         self.config_manager = config_manager
         self.client_manager = client_manager
         self.session_manager = session_manager
-        self.app: Optional[web.Application] = None
-        self.runner: Optional[web.AppRunner] = None
-        self.site: Optional[web.TCPSite] = None
+        self.app: web.Application | None = None
+        self.runner: web.AppRunner | None = None
+        self.site: web.TCPSite | None = None
         self._lock = asyncio.Lock()
         self._jwt_algorithm = "RS256"  # 使用 RS256 非对称加密
         # 初始化密钥管理器
@@ -994,7 +994,7 @@ class OIDCServer:
             keep_old_keys=2,
         )
         # 启动自动保存任务
-        self._save_task: Optional[asyncio.Task] = None
+        self._save_task: asyncio.Task | None = None
         self._start_auto_save()
 
     def _get_rsa_private_key_pem(self) -> str:
@@ -1020,7 +1020,6 @@ class OIDCServer:
 
     def _get_jwks_keys(self) -> list[dict]:
         """获取 JWKS 格式的所有活跃公钥（不包含私钥信息）"""
-        from cryptography.hazmat.primitives import serialization
         import base64
 
         def int_to_base64url(value: int) -> str:
@@ -1271,7 +1270,7 @@ class OIDCServer:
 
             return True, verify_code.session_id
 
-    async def get_session(self, session_id: str) -> Optional[AuthSession]:
+    async def get_session(self, session_id: str) -> AuthSession | None:
         logger.info(
             f"get_session: session_id={session_id[:8]}..., sessions count={len(self.sessions)}, keys={list(self.sessions.keys())[:5]}"
         )
@@ -1280,7 +1279,7 @@ class OIDCServer:
             return self._dict_to_session(session_data)
         return None
 
-    async def exchange_code(self, code: str, client_id: str = "") -> Optional[dict]:
+    async def exchange_code(self, code: str, client_id: str = "") -> dict | None:
         logger.info(f"exchange_code: client_id={client_id}")
         async with self._lock:
             session = None
@@ -1344,7 +1343,7 @@ class OIDCServer:
 
     async def exchange_refresh_token(
         self, refresh_token: str, client_id: str = ""
-    ) -> Optional[dict]:
+    ) -> dict | None:
         """使用 refresh_token 换取新的 access_token"""
         async with self._lock:
             token_data = self.session_manager.get_access_token(refresh_token)
@@ -1406,7 +1405,7 @@ class OIDCServer:
 
             return new_token_data
 
-    async def get_user_info(self, token: str) -> Optional[dict]:
+    async def get_user_info(self, token: str) -> dict | None:
         return self.session_manager.get_access_token(token)
 
     async def cleanup_expired(self):
@@ -1518,14 +1517,16 @@ class RateLimiter:
             if len(self._attempts[key]) >= self.max_attempts:
                 # 触发锁定
                 self._lockouts[key] = current_time + self.lockout_duration
-                
+
                 # 调用回调函数记录告警
                 if self.on_rate_limit_triggered:
                     try:
-                        await self.on_rate_limit_triggered(identifier, ip, len(self._attempts[key]))
+                        await self.on_rate_limit_triggered(
+                            identifier, ip, len(self._attempts[key])
+                        )
                     except Exception as e:
                         logger.error(f"速率限制告警回调失败: {e}")
-                
+
                 return (
                     False,
                     f"登录尝试次数过多，已锁定 {self.lockout_duration // 60} 分钟",
@@ -1594,7 +1595,7 @@ class WebHandler:
         self.client_manager = client_manager
         self.audit_log_manager = audit_log_manager
         self.sessions: dict[str, dict] = {}
-        
+
         # 速率限制告警回调函数
         async def on_rate_limit_triggered(identifier: str, ip: str, attempts: int):
             self.audit_log_manager.log(
@@ -1603,8 +1604,10 @@ class WebHandler:
                 user=identifier,
                 ip=ip,
             )
-            logger.warning(f"速率限制触发: 用户={identifier}, IP={ip}, 尝试次数={attempts}")
-        
+            logger.warning(
+                f"速率限制触发: 用户={identifier}, IP={ip}, 尝试次数={attempts}"
+            )
+
         # 初始化速率限制器
         self.rate_limiter = RateLimiter(
             max_attempts=5,
@@ -2555,7 +2558,7 @@ class WebHandler:
         self, theme_color: str, icon_html: str, favicon_url: str
     ) -> str:
         """内置登录页面模板（当外部模板不可用时使用）"""
-        return f'''<!DOCTYPE html>
+        return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -2604,13 +2607,13 @@ class WebHandler:
             <form id="loginForm" class="space-y-6">
                 <div>
                     <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">用户名</label>
-                    <input type="text" id="username" name="username" required 
+                    <input type="text" id="username" name="username" required
                         class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400"
                         placeholder="请输入用户名">
                 </div>
                 <div>
                     <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">密码</label>
-                    <input type="password" id="password" name="password" required 
+                    <input type="password" id="password" name="password" required
                         class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400"
                         placeholder="请输入密码">
                 </div>
@@ -2626,7 +2629,7 @@ class WebHandler:
 
     <script>
         const basePath = window.location.pathname.substring(0, window.location.pathname.lastIndexOf('/')) + '/';
-        
+
         async function checkPasswordStatus() {{
             try {{
                 const response = await fetch(basePath + 'api/check_password');
@@ -2640,19 +2643,19 @@ class WebHandler:
                 console.error('检查密码状态失败:', err);
             }}
         }}
-        
+
         checkPasswordStatus();
-        
+
         document.getElementById('loginForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
             const errorMsg = document.getElementById('errorMsg');
             const btn = e.target.querySelector('button');
-            
+
             btn.disabled = true;
             btn.innerHTML = '<svg class="animate-spin h-5 w-5 mx-auto" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
-            
+
             try {{
                 const response = await fetch(basePath + 'api/login', {{
                     method: 'POST',
@@ -2660,7 +2663,7 @@ class WebHandler:
                     body: JSON.stringify({{ username, password }})
                 }});
                 const data = await response.json();
-                
+
                 if (data.success) {{
                     localStorage.setItem('token', data.token);
                     window.location.href = basePath.substring(0, basePath.length - 1);
@@ -2679,7 +2682,7 @@ class WebHandler:
         }});
     </script>
 </body>
-</html>'''
+</html>"""
 
     def _render_admin_page(
         self,
@@ -2689,7 +2692,7 @@ class WebHandler:
         favicon_url: str = "",
     ) -> str:
         warning_html = (
-            f"""
+            """
         <div class="bg-amber-50 border border-amber-100 text-amber-700 px-6 py-4 rounded-2xl flex items-center gap-4 mb-8 shadow-sm">
             <div class="bg-amber-100 p-2 rounded-xl">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2709,7 +2712,7 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>"""
         )
 
-        return f'''<!DOCTYPE html>
+        return rf"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -3147,7 +3150,7 @@ class WebHandler:
         const token = localStorage.getItem('token');
         const basePath = window.location.pathname.endsWith('/') ? window.location.pathname : window.location.pathname + '/';
         if (!token) {{ window.location.href = basePath + 'login'; }}
-        
+
         document.querySelectorAll('.tab').forEach(tab => {{
             tab.addEventListener('click', () => {{
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('tab-active'));
@@ -3156,7 +3159,7 @@ class WebHandler:
                 document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
             }});
         }});
-        
+
         function showToast(message, type) {{
             const toast = document.getElementById('toast');
             toast.textContent = message;
@@ -3168,7 +3171,7 @@ class WebHandler:
                 toast.style.opacity = '0';
             }}, 3000);
         }}
-        
+
         async function loadConfig() {{
             try {{
                 const response = await fetch(basePath + 'api/config', {{
@@ -3176,10 +3179,10 @@ class WebHandler:
                 }});
                 const data = await response.json();
                 if (!data.success) {{ window.location.href = basePath + 'login'; return; }}
-                
+
                 const config = data.config;
                 const baseUrl = window.location.origin;
-                
+
                 document.getElementById('discoveryUrl').textContent = baseUrl + '/.well-known/openid-configuration';
                 document.getElementById('authUrl').textContent = baseUrl + '/authorize';
                 document.getElementById('tokenUrl').textContent = baseUrl + '/token';
@@ -3187,20 +3190,20 @@ class WebHandler:
                 document.getElementById('groupVerify').textContent = config.enable_group_verify ? '已启用' : '已禁用';
                 document.getElementById('privateVerify').textContent = config.enable_private_verify ? '已启用' : '已禁用';
                 document.getElementById('verifyGroup').textContent = config.verify_group_id || '未配置';
-                
+
                 document.getElementById('codeLength').value = config.code_length || 6;
                 document.getElementById('codeExpire').value = config.code_expire_seconds || 300;
                 document.getElementById('pollInterval').value = config.poll_interval || 1;
                 document.getElementById('enableGroupVerify').checked = config.enable_group_verify !== false;
                 document.getElementById('enablePrivateVerify').checked = config.enable_private_verify !== false;
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
-                
+
                 const themeColor = config.theme_color || '#4f46e5';
                 document.getElementById('themeColor').value = themeColor;
                 document.getElementById('themeColorText').value = themeColor;
                 document.getElementById('iconUrl').value = config.icon_url || '';
                 document.getElementById('faviconUrl').value = config.favicon_url || '';
-                
+
                 // 更新Favicon
                 if (config.favicon_url) {{
                     let favicon = document.querySelector('link[rel="icon"]');
@@ -3216,7 +3219,7 @@ class WebHandler:
                 console.error('加载配置失败:', err);
             }}
         }}
-        
+
         async function saveConfig() {{
             const config = {{
                 code_length: parseInt(document.getElementById('codeLength').value),
@@ -3229,18 +3232,18 @@ class WebHandler:
                 icon_url: document.getElementById('iconUrl').value,
                 favicon_url: document.getElementById('faviconUrl').value
             }};
-            
+
             try {{
                 const response = await fetch(basePath + 'api/config/save', {{
                     method: 'POST',
-                    headers: {{ 
+                    headers: {{
                         'Content-Type': 'application/json',
                         'Authorization': 'Bearer ' + token
                     }},
                     body: JSON.stringify(config)
                 }});
                 const data = await response.json();
-                
+
                 if (data.success) {{
                     showToast('配置保存成功！页面将刷新以应用新的主题色和图标设置。', 'success');
                     document.getElementById('groupVerify').textContent = config.enable_group_verify ? '已启用' : '已禁用';
@@ -3255,7 +3258,7 @@ class WebHandler:
                 showToast('网络错误，请重试', 'error');
             }}
         }}
-        
+
         async function loadSessions() {{
             try {{
                 const response = await fetch(basePath + 'api/sessions', {{
@@ -3263,14 +3266,14 @@ class WebHandler:
                 }});
                 const data = await response.json();
                 if (!data.success) return;
-                
+
                 document.getElementById('sessionCount').textContent = `${{data.sessions.length}} 个活跃会话`;
                 const tbody = document.getElementById('sessionTable');
                 if (data.sessions.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="4" class="px-8 py-12 text-center text-slate-400 font-medium">暂无认证会话</td></tr>';
                     return;
                 }}
-                
+
                 tbody.innerHTML = data.sessions.map(s => `
                     <tr class="hover:bg-slate-50/50 transition-colors">
                         <td class="px-8 py-4"><code class="bg-primary/10 text-primary px-2 py-1 rounded-lg font-bold text-sm">${{s.code}}</code></td>
@@ -3288,7 +3291,7 @@ class WebHandler:
                 console.error('加载会话失败:', err);
             }}
         }}
-        
+
         async function loadClients() {{
             try {{
                 const response = await fetch(basePath + 'api/clients', {{
@@ -3296,20 +3299,20 @@ class WebHandler:
                 }});
                 const data = await response.json();
                 if (!data.success) return;
-                
+
                 document.getElementById('clientCount').textContent = `${{data.clients.length}} 个客户端`;
                 const tbody = document.getElementById('clientTable');
                 if (data.clients.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="7" class="px-6 py-12 text-center text-slate-400 font-medium">暂无客户端，请添加新客户端</td></tr>';
                     return;
                 }}
-                
+
                 function truncateUrl(url, maxLen = 20) {{
                     if (!url) return '<span class="text-slate-300">-</span>';
                     if (url.length <= maxLen) return url;
                     return url.substring(0, maxLen) + '...';
                 }}
-                
+
                 tbody.innerHTML = data.clients.map(c => `
                     <tr class="hover:bg-slate-50/50 transition-colors">
                         <td class="px-6 py-4 text-sm font-bold text-slate-700">
@@ -3383,7 +3386,7 @@ class WebHandler:
                 console.error('加载客户端失败:', err);
             }}
         }}
-        
+
         function copyText(text) {{
             navigator.clipboard.writeText(text).then(() => {{
                 showToast('已复制到剪贴板', 'success');
@@ -3535,21 +3538,21 @@ class WebHandler:
                 showToast('网络错误，请重试', 'error');
             }}
         }}
-        
+
         async function deleteClient(clientId) {{
             if (!confirm(`确定要删除客户端 "${{clientId}}" 吗？`)) return;
-            
+
             try {{
                 const response = await fetch(basePath + 'api/clients/delete', {{
                     method: 'POST',
-                    headers: {{ 
+                    headers: {{
                         'Content-Type': 'application/json',
                         'Authorization': 'Bearer ' + token
                     }},
                     body: JSON.stringify({{ client_id: clientId }})
                 }});
                 const data = await response.json();
-                
+
                 if (data.success) {{
                     showToast('客户端删除成功！', 'success');
                     loadClients();
@@ -3561,7 +3564,7 @@ class WebHandler:
                 showToast('网络错误，请重试', 'error');
             }}
         }}
-        
+
         async function logout() {{
             await fetch(basePath + 'api/logout', {{
                 method: 'POST',
@@ -3570,18 +3573,18 @@ class WebHandler:
             localStorage.removeItem('token');
             window.location.href = basePath + 'login';
         }}
-        
+
         document.getElementById('themeColor').addEventListener('input', function(e) {{
             document.getElementById('themeColorText').value = e.target.value;
         }});
-        
+
         document.getElementById('themeColorText').addEventListener('input', function(e) {{
             const color = e.target.value;
             if (/^#[0-9A-Fa-f]{{6}}$/.test(color)) {{
                 document.getElementById('themeColor').value = color;
             }}
         }});
-        
+
         // 审计日志相关变量
         let currentLogPage = 0;
         const logsPerPage = 20;
@@ -3680,7 +3683,7 @@ class WebHandler:
         setInterval(loadSessions, 5000);
     </script>
 </body>
-</html>'''
+</html>"""
 
     def _render_verify_page(
         self,
@@ -3766,7 +3769,7 @@ class WebHandler:
 
         private_info = ""
         if enable_private_verify:
-            private_info = f"""
+            private_info = """
             <div class="flex items-start gap-3 p-4 bg-teal-50 rounded-2xl border border-teal-100">
                 <div class="bg-teal-500 p-1.5 rounded-lg text-white">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -3779,6 +3782,11 @@ class WebHandler:
                 </div>
             </div>"""
 
+        # 生成验证码 HTML
+        code_chars_html = " ".join(
+            [f'<span class="code-char">{char}</span>' for char in code]
+        )
+
         # 从模板文件加载
         try:
             from .templates import template_manager
@@ -3789,6 +3797,7 @@ class WebHandler:
                 icon_html=icon_html,
                 favicon_url=favicon_url,
                 code=code,
+                code_chars_html=code_chars_html,
                 session_id=session_id,
                 auth_code=auth_code,
                 redirect_uri=redirect_uri,
@@ -3806,6 +3815,7 @@ class WebHandler:
                 icon_html,
                 favicon_url,
                 code,
+                code_chars_html,
                 session_id,
                 auth_code,
                 redirect_uri,
@@ -3823,6 +3833,7 @@ class WebHandler:
         icon_html: str,
         favicon_url: str,
         code: str,
+        code_chars_html: str,
         session_id: str,
         auth_code: str,
         redirect_uri: str,
@@ -3836,12 +3847,14 @@ class WebHandler:
         """内置验证页面模板（备用）"""
         try:
             from .templates import template_manager
+
             template = template_manager.get_template("verify")
             return template.format(
                 theme_color=theme_color,
                 icon_html=icon_html,
                 favicon_url=favicon_url,
                 code=code,
+                code_chars_html=code_chars_html,
                 session_id=session_id,
                 auth_code=auth_code,
                 redirect_uri=redirect_uri,
@@ -3854,7 +3867,7 @@ class WebHandler:
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}")
-            return f'<html><body><h1>模板加载失败: {e}</h1></body></html>'
+            return f"<html><body><h1>模板加载失败: {e}</h1></body></html>"
 
     def _render_verify_input_page(self, code: str, session_id: str) -> str:
         """渲染手动验证输入页面
@@ -3898,10 +3911,15 @@ class WebHandler:
             )
 
     def _render_verify_input_page_builtin(
-        self, theme_color: str, icon_html: str, favicon_url: str, code: str, poll_interval_ms: int = 1000
+        self,
+        theme_color: str,
+        icon_html: str,
+        favicon_url: str,
+        code: str,
+        poll_interval_ms: int = 1000,
     ) -> str:
         """内置验证输入页面模板（备用）"""
-        return f'''<!DOCTYPE html>
+        return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -3943,22 +3961,22 @@ class WebHandler:
             <form id="verifyForm" class="space-y-6">
                 <div>
                     <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">验证码</label>
-                    <input type="text" id="code" name="code" value="{code}" required 
+                    <input type="text" id="code" name="code" value="{code}" required
                         class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400 font-mono text-lg tracking-wider"
                         placeholder="请输入验证码">
                 </div>
                 <div>
                     <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">用户 ID</label>
-                    <input type="text" id="userId" name="userId" required 
+                    <input type="text" id="userId" name="userId" required
                         class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400"
                         placeholder="请输入您的 QQ 号或用户 ID">
                 </div>
-                <button type="submit" 
+                <button type="submit"
                     class="w-full py-4 bg-primary hover:opacity-90 text-white rounded-2xl font-bold text-lg shadow-lg shadow-primary/30 transition-all active:scale-[0.98] flex items-center justify-center gap-2">
                     <span>立即验证</span>
                 </button>
             </form>
-            
+
             <div id="message" class="mt-6 text-center p-4 rounded-2xl text-sm font-bold hidden"></div>
         </div>
         <p class="text-center text-slate-400 text-sm mt-8">Powered by <a href="https://github.com/AstrBotDevs/AstrBot" target="_blank" class="text-primary hover:opacity-80">AstrBot</a> & <a href="https://www.chuyel.cn" target="_blank" class="text-primary hover:opacity-80">初叶🍂竹叶-Furry控</a></p>
@@ -3966,18 +3984,18 @@ class WebHandler:
 
     <script>
         var POLL_INTERVAL_MS = {poll_interval_ms};
-        
+
         document.getElementById('verifyForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
             const code = document.getElementById('code').value;
             const userId = document.getElementById('userId').value;
             const message = document.getElementById('message');
             const btn = e.target.querySelector('button');
-            
+
             btn.disabled = true;
             const originalBtnContent = btn.innerHTML;
             btn.innerHTML = '<svg class="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
-            
+
             try {{
                 const response = await fetch('../api/verify', {{
                     method: 'POST',
@@ -3985,9 +4003,9 @@ class WebHandler:
                     body: JSON.stringify({{ code, user_id: userId }})
                 }});
                 const data = await response.json();
-                
+
                 message.classList.remove('hidden', 'bg-teal-50', 'text-teal-600', 'bg-rose-50', 'text-rose-600');
-                
+
                 if (data.success) {{
                     message.classList.add('bg-teal-50', 'text-teal-600');
                     message.textContent = '验证成功！正在跳转...';
@@ -4010,7 +4028,7 @@ class WebHandler:
         }});
     </script>
 </body>
-</html>'''
+</html>"""
 
 
 @register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.3")
@@ -4027,12 +4045,12 @@ class ChuyeOIDCPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config
-        self.config_manager: Optional[ConfigManager] = None
-        self.client_manager: Optional[ClientManager] = None
-        self.audit_log_manager: Optional[AuditLogManager] = None
-        self.oidc_server: Optional[OIDCServer] = None
-        self.web_handler: Optional[WebHandler] = None
-        self._cleanup_task: Optional[asyncio.Task] = None
+        self.config_manager: ConfigManager | None = None
+        self.client_manager: ClientManager | None = None
+        self.audit_log_manager: AuditLogManager | None = None
+        self.oidc_server: OIDCServer | None = None
+        self.web_handler: WebHandler | None = None
+        self._cleanup_task: asyncio.Task | None = None
 
     def _get_config(self, key: str, default=None):
         if not self.config:
@@ -4140,7 +4158,7 @@ class ChuyeOIDCPlugin(Star):
                 await asyncio.sleep(30)
                 if self.oidc_server:
                     await self.oidc_server.cleanup_expired()
-                
+
                 if self.oidc_server and self.oidc_server.key_manager:
                     try:
                         rotated = await self.oidc_server.key_manager.rotate_keys()
@@ -4222,7 +4240,7 @@ class ChuyeOIDCPlugin(Star):
         )
 
         if success:
-            yield event.plain_result(f"验证成功！您已通过OIDC认证。")
+            yield event.plain_result("验证成功！您已通过OIDC认证。")
         else:
             yield event.plain_result(f"验证失败：{result}")
 
@@ -4298,4 +4316,4 @@ class ChuyeOIDCPlugin(Star):
             logger.info(
                 f"验证码验证成功: user_id={user_id}, session_id={result[:8]}..."
             )
-            yield event.plain_result(f"✅ 验证成功！您已通过OIDC认证。")
+            yield event.plain_result("✅ 验证成功！您已通过OIDC认证。")
