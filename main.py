@@ -1,3 +1,12 @@
+"""
+AstrBot OIDC 登录插件
+
+用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
+
+作者: 初叶🍂竹叶-Furry控
+版本: v1.0.0
+"""
+
 import asyncio
 import json
 import os
@@ -19,6 +28,8 @@ from astrbot.api.star import Context, Star, register
 
 @dataclass
 class AuthSession:
+    """OIDC 认证会话数据类"""
+
     session_id: str
     code: str
     state: str
@@ -32,6 +43,8 @@ class AuthSession:
 
 @dataclass
 class VerifyCode:
+    """验证码数据类"""
+
     code: str
     session_id: str
     created_at: float
@@ -39,6 +52,12 @@ class VerifyCode:
 
 
 class ConfigManager:
+    """Web 配置管理器
+
+    管理插件的 Web 端配置，包括验证码设置、主题设置等。
+    数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失。
+    """
+
     def __init__(self, plugin):
         self.plugin = plugin
         # 数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失
@@ -96,6 +115,12 @@ class ConfigManager:
 
 
 class ClientManager:
+    """OIDC 客户端管理器
+
+    管理 OIDC 客户端（应用）的注册信息，包括 Client ID、Client Secret 等。
+    数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失。
+    """
+
     def __init__(self):
         # 数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失
         self.data_dir = os.path.join(os.getcwd(), "data", "chuyeoidc")
@@ -197,6 +222,15 @@ class ClientManager:
 
 
 class OIDCServer:
+    """OIDC 服务端核心类
+
+    处理 OIDC 协议相关的所有逻辑，包括：
+    - 认证会话管理
+    - 验证码生成和验证
+    - Access Token 生成和验证
+    - 用户信息获取
+    """
+
     def __init__(
         self, plugin, config_manager: ConfigManager, client_manager: ClientManager
     ):
@@ -375,6 +409,14 @@ class OIDCServer:
 
 
 class WebHandler:
+    """Web 请求处理器
+
+    处理所有 HTTP 请求，包括：
+    - OIDC 端点（发现文档、授权、令牌、用户信息）
+    - Web 管理后台页面和 API
+    - 验证码输入页面
+    """
+
     def __init__(
         self,
         plugin,
@@ -953,13 +995,18 @@ class WebHandler:
                     {"success": False, "message": "会话不存在"}, status=404
                 )
 
-            return web.json_response(
+            # 添加缓存控制头
+            response = web.json_response(
                 {
                     "success": True,
                     "verified": session.verified,
                     "verified_user_id": session.verified_user_id,
                 }
             )
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            return response
         except Exception as e:
             logger.error(f"获取会话状态错误: {e}")
             return web.json_response(
@@ -1914,8 +1961,8 @@ class WebHandler:
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 bg-[radial-gradient(circle_at_bottom_right,_var(--tw-gradient-stops))] from-indigo-100 via-slate-50 to-teal-50">
-    <div class="max-w-md w-full">
-        <div class="glass rounded-[2.5rem] shadow-2xl shadow-primary/30 p-8 md:p-10 border border-white text-center">
+    <div class="w-full max-w-md mx-auto">
+        <div class="glass rounded-[2.5rem] shadow-2xl shadow-primary/30 p-6 sm:p-8 md:p-10 border border-white text-center">
             <div class="mb-6">
                 <div class="inline-flex items-center justify-center w-16 h-16 mb-6">
                     {icon_html}
@@ -1970,12 +2017,15 @@ class WebHandler:
     </div>
 
     <script>
-        const sessionId = '{session_id}';
-        const code = '{code}';
-        let isVerified = false;
-        let redirected = false;
-        let lastCheckTime = 0;
-        const CHECK_INTERVAL = 2000; // 2秒限制
+        var sessionId = '{session_id}';
+        var code = '{code}';
+        var isVerified = false;
+        var redirected = false;
+        var lastClickTime = 0;
+        var CLICK_INTERVAL = 2000;
+        var checkIntervalId = null;
+        var lastPollTime = 0;
+        var POLL_INTERVAL_MS = 1000;
         
         function doRedirect() {{
             if (redirected) return;
@@ -1984,18 +2034,28 @@ class WebHandler:
         }}
         
         function updateUIForVerified() {{
+            if (isVerified) return;
             isVerified = true;
-            document.getElementById('status').classList.add('hidden');
-            document.getElementById('successStatus').classList.remove('hidden');
-            document.getElementById('confirmBtn').textContent = '验证成功，点击继续';
-            document.getElementById('confirmBtn').classList.add('bg-teal-500');
-            document.getElementById('confirmBtn').classList.remove('bg-primary');
-            document.getElementById('errorMsg').classList.add('hidden');
+            
+            var statusEl = document.getElementById('status');
+            var successStatusEl = document.getElementById('successStatus');
+            var confirmBtn = document.getElementById('confirmBtn');
+            var errorMsg = document.getElementById('errorMsg');
+            
+            if (statusEl) statusEl.classList.add('hidden');
+            if (successStatusEl) successStatusEl.classList.remove('hidden');
+            if (confirmBtn) {{
+                confirmBtn.textContent = '验证成功，点击继续';
+                confirmBtn.classList.add('bg-teal-500');
+                confirmBtn.classList.remove('bg-primary');
+                confirmBtn.disabled = false;
+            }}
+            if (errorMsg) errorMsg.classList.add('hidden');
         }}
         
         function checkAndRedirect() {{
-            const now = Date.now();
-            const errorMsg = document.getElementById('errorMsg');
+            var now = Date.now();
+            var errorMsg = document.getElementById('errorMsg');
             
             // 如果已经验证过了，直接跳转
             if (isVerified) {{
@@ -2004,69 +2064,145 @@ class WebHandler:
             }}
             
             // 检查是否在2秒冷却期内
-            if (now - lastCheckTime < CHECK_INTERVAL) {{
+            if (now - lastClickTime < CLICK_INTERVAL) {{
                 errorMsg.textContent = '请稍后再试（每2秒可请求一次）';
                 errorMsg.classList.remove('hidden');
                 return;
             }}
             
-            lastCheckTime = now;
+            lastClickTime = now;
+            errorMsg.classList.add('hidden');
             
             // 显示加载状态
-            const btn = document.getElementById('confirmBtn');
-            const originalText = btn.textContent;
+            var btn = document.getElementById('confirmBtn');
+            var originalText = btn.textContent;
             btn.textContent = '检查中...';
             btn.disabled = true;
             
-            // 发送请求检查状态
-            fetch('../api/session/status?session_id=' + sessionId)
-                .then(response => response.json())
-                .then(data => {{
-                    console.log('点击检查状态响应:', data);
-                    if (data.success && data.verified) {{
-                        updateUIForVerified();
-                        // 延迟一下再跳转，让用户看到验证成功的状态
-                        setTimeout(doRedirect, 500);
+            // 使用 XMLHttpRequest 发送请求
+            var xhr = new XMLHttpRequest();
+            var url = '../api/session/status?session_id=' + sessionId + '&_t=' + Date.now();
+            xhr.open('GET', url, true);
+            xhr.setRequestHeader('Cache-Control', 'no-cache');
+            xhr.onreadystatechange = function() {{
+                if (xhr.readyState === 4) {{
+                    if (xhr.status === 200) {{
+                        try {{
+                            var data = JSON.parse(xhr.responseText);
+                            if (data.success === true && data.verified === true) {{
+                                updateUIForVerified();
+                                // 延迟一下再跳转，让用户看到验证成功的状态
+                                setTimeout(doRedirect, 800);
+                            }} else {{
+                                errorMsg.textContent = '尚未完成验证，请在QQ中发送验证码';
+                                errorMsg.classList.remove('hidden');
+                                btn.textContent = originalText;
+                                btn.disabled = false;
+                            }}
+                        }} catch (e) {{
+                            errorMsg.textContent = '解析响应失败';
+                            errorMsg.classList.remove('hidden');
+                            btn.textContent = originalText;
+                            btn.disabled = false;
+                        }}
                     }} else {{
-                        errorMsg.textContent = '尚未完成验证，请在QQ中发送验证码';
+                        errorMsg.textContent = '网络错误，请重试';
                         errorMsg.classList.remove('hidden');
                         btn.textContent = originalText;
                         btn.disabled = false;
                     }}
-                }})
-                .catch(err => {{
-                    console.error('检查状态失败:', err);
-                    errorMsg.textContent = '网络错误，请重试';
-                    errorMsg.classList.remove('hidden');
-                    btn.textContent = originalText;
-                    btn.disabled = false;
-                }});
+                }}
+            }};
+            xhr.send();
         }}
         
-        function checkStatus(isManual = false) {{
-            fetch('../api/session/status?session_id=' + sessionId)
-                .then(response => response.json())
-                .then(data => {{
-                    if (data.success && data.verified && !isVerified) {{
-                        updateUIForVerified();
-                    }}
-                }})
-                .catch(err => {{}});
+        function checkStatus() {{
+            if (isVerified) return;
+            
+            var xhr = new XMLHttpRequest();
+            // 添加时间戳防止缓存
+            var url = '../api/session/status?session_id=' + sessionId + '&_t=' + Date.now();
+            xhr.open('GET', url, true);
+            xhr.setRequestHeader('Cache-Control', 'no-cache');
+            xhr.onreadystatechange = function() {{
+                if (xhr.readyState === 4 && xhr.status === 200) {{
+                    try {{
+                        var data = JSON.parse(xhr.responseText);
+                        if (data.success === true && data.verified === true && !isVerified) {{
+                            updateUIForVerified();
+                            // 验证成功后停止轮询
+                            if (checkIntervalId) {{
+                                clearInterval(checkIntervalId);
+                                checkIntervalId = null;
+                            }}
+                        }}
+                    }} catch (e) {{}}
+                }}
+            }};
+            xhr.send();
         }}
         
+        // 使用 requestAnimationFrame 保持活跃
+        function scheduleCheck(timestamp) {{
+            if (isVerified) return;
+            
+            // 如果距离上次检查超过间隔时间，执行检查
+            if (timestamp - lastPollTime >= POLL_INTERVAL_MS) {{
+                lastPollTime = timestamp;
+                checkStatus();
+            }}
+            
+            requestAnimationFrame(scheduleCheck);
+        }}
+        
+        // 页面可见性变化时立即检查（多次）
         document.addEventListener('visibilitychange', function() {{
-            if (!document.hidden) {{
+            if (!document.hidden && !isVerified) {{
+                lastPollTime = 0;
+                // 立即检查，然后每隔100ms检查一次，共检查10次
+                checkStatus();
+                for (var i = 1; i <= 10; i++) {{
+                    setTimeout(function() {{
+                        if (!isVerified) checkStatus();
+                    }}, i * 100);
+                }}
+            }}
+        }});
+        
+        // 窗口获得焦点时立即检查（多次）
+        window.addEventListener('focus', function() {{
+            if (!isVerified) {{
+                lastPollTime = 0;
+                checkStatus();
+                for (var i = 1; i <= 10; i++) {{
+                    setTimeout(function() {{
+                        if (!isVerified) checkStatus();
+                    }}, i * 100);
+                }}
+            }}
+        }});
+        
+        // 点击页面任意位置时检查
+        document.addEventListener('click', function() {{
+            if (!isVerified) {{
                 checkStatus();
             }}
         }});
         
-        window.addEventListener('focus', function() {{
-            checkStatus();
+        // 鼠标移动时检查（节流）
+        var lastMouseMoveCheck = 0;
+        document.addEventListener('mousemove', function() {{
+            var now = Date.now();
+            if (!isVerified && now - lastMouseMoveCheck > 500) {{
+                lastMouseMoveCheck = now;
+                checkStatus();
+            }}
         }});
         
-        // 页面加载后立即开始轮询
+        // 页面加载后立即开始
         checkStatus();
-        setInterval(checkStatus, 1500);
+        requestAnimationFrame(scheduleCheck);
+        checkIntervalId = setInterval(checkStatus, 1000);
     </script>
 </body>
 </html>'''
@@ -2198,8 +2334,17 @@ class WebHandler:
 </html>'''
 
 
-@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.0")
+@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.1")
 class ChuyeOIDCPlugin(Star):
+    """OIDC 登录插件主类
+
+    AstrBot 插件入口类，负责：
+    - 插件初始化和配置加载
+    - Web 服务启动
+    - QQ 消息处理（验证码验证）
+    - 插件生命周期管理
+    """
+
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config
@@ -2213,6 +2358,12 @@ class ChuyeOIDCPlugin(Star):
         if not self.config:
             return default
         return self.config.get(key, default)
+
+    def _get_web_config(self, key: str, default=None):
+        """获取Web配置"""
+        if hasattr(self, "config_manager") and self.config_manager:
+            return self.config_manager.get(key, default)
+        return default
 
     async def initialize(self):
         logger.info("OIDC登录插件正在初始化...")
@@ -2285,6 +2436,8 @@ class ChuyeOIDCPlugin(Star):
         message_str = event.get_message_str().strip()
         code = message_str.replace("验证码", "").strip()
 
+        logger.info(f"收到验证码命令: {code}")
+
         if not code:
             yield event.plain_result("请输入验证码，例如：验证码 123456")
             return
@@ -2292,6 +2445,41 @@ class ChuyeOIDCPlugin(Star):
         if not self.oidc_server:
             yield event.plain_result("服务未初始化")
             return
+
+        # 检查群聊限制
+        message_type = event.get_message_type()
+        is_group = (
+            message_type.value == "GroupMessage" or message_type.name == "GROUP_MESSAGE"
+        )
+        group_id = event.get_group_id() if is_group else ""
+        enable_group_verify = self._get_web_config("enable_group_verify", True)
+        enable_private_verify = self._get_web_config("enable_private_verify", True)
+        verify_group_id = self._get_web_config("verify_group_id", "")
+
+        logger.info(
+            f"消息类型: {message_type}, is_group: {is_group}, group_id: {group_id}"
+        )
+        logger.info(
+            f"群聊验证启用: {enable_group_verify}, 私聊验证启用: {enable_private_verify}, 允许的群: {verify_group_id}"
+        )
+
+        if is_group:
+            # 群聊消息
+            if not enable_group_verify:
+                logger.info("群聊验证未启用，跳过")
+                return
+            # 检查是否在允许的群聊中
+            allowed_groups = [
+                g.strip() for g in verify_group_id.split(",") if g.strip()
+            ]
+            if allowed_groups and group_id not in allowed_groups:
+                logger.info(f"群聊 {group_id} 不在允许的验证群列表中: {allowed_groups}")
+                return
+        else:
+            # 私聊消息
+            if not enable_private_verify:
+                logger.info("私聊验证未启用，跳过")
+                return
 
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
@@ -2316,11 +2504,52 @@ class ChuyeOIDCPlugin(Star):
             return
 
         code = message_str
+        logger.info(f"收到验证码: {code}")
+
+        # 先检查验证码是否存在，避免不必要的群聊检查
+        if code not in self.oidc_server.verify_codes:
+            logger.info(
+                f"验证码不存在: {code}, 当前验证码列表: {list(self.oidc_server.verify_codes.keys())}"
+            )
+            return
+
+        # 检查群聊限制
+        message_type = event.get_message_type()
+        is_group = (
+            message_type.value == "GroupMessage" or message_type.name == "GROUP_MESSAGE"
+        )
+        group_id = event.get_group_id() if is_group else ""
+        enable_group_verify = self._get_web_config("enable_group_verify", True)
+        enable_private_verify = self._get_web_config("enable_private_verify", True)
+        verify_group_id = self._get_web_config("verify_group_id", "")
+
+        logger.info(
+            f"消息类型: {message_type}, is_group: {is_group}, group_id: {group_id}"
+        )
+        logger.info(
+            f"群聊验证启用: {enable_group_verify}, 私聊验证启用: {enable_private_verify}, 允许的群: {verify_group_id}"
+        )
+
+        if is_group:
+            # 群聊消息
+            if not enable_group_verify:
+                logger.info("群聊验证未启用，跳过")
+                return
+            # 检查是否在允许的群聊中
+            allowed_groups = [
+                g.strip() for g in verify_group_id.split(",") if g.strip()
+            ]
+            if allowed_groups and group_id not in allowed_groups:
+                logger.info(f"群聊 {group_id} 不在允许的验证群列表中: {allowed_groups}")
+                return
+        else:
+            # 私聊消息
+            if not enable_private_verify:
+                logger.info("私聊验证未启用，跳过")
+                return
+
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
-
-        if code not in self.oidc_server.verify_codes:
-            return
 
         success, result = await self.oidc_server.verify_code_submit(
             code, user_id, {"id": user_id, "name": user_name}
