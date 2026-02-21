@@ -9,10 +9,10 @@ AstrBot OIDC 登录插件
 
 import asyncio
 import hashlib
+import hmac
 import html
 import json
 import os
-import random
 import re
 import secrets
 import string
@@ -34,34 +34,63 @@ from astrbot.api.star import Context, Star, StarTools, register
 def hash_password(password: str) -> str:
     """对密码进行哈希处理
 
-    使用 SHA-256 加盐哈希，增加安全性。
-    注意：这不是最安全的方案，生产环境建议使用 bcrypt 或 Argon2。
+    使用 PBKDF2-HMAC-SHA256 算法，这是 Python 标准库中提供的安全密码哈希方案。
+    相比简单 SHA-256，PBKDF2 通过多次迭代（100,000次）增加暴力破解难度。
+
+    格式: pbkdf2_sha256$iterations$salt$hash
 
     Args:
         password: 明文密码
 
     Returns:
-        哈希后的密码（格式：salt:hash）
+        哈希后的密码
     """
     salt = secrets.token_hex(16)
-    pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
-    return f"{salt}:{pwd_hash}"
+    iterations = 100000  # 迭代次数，增加计算时间以抵抗暴力破解
+    pwd_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations
+    ).hex()
+    return f"pbkdf2_sha256${iterations}${salt}${pwd_hash}"
 
 
 def verify_password(password: str, hashed: str) -> bool:
     """验证密码
 
+    支持两种格式：
+    1. 新的 PBKDF2 格式: pbkdf2_sha256$iterations$salt$hash
+    2. 旧的 SHA-256 格式: salt:hash（向后兼容）
+
+    安全说明：
+    - 使用 hmac.compare_digest 进行常量时间比较，防止时序攻击
+    - 无论密码是否正确，计算时间都保持一致
+
     Args:
         password: 明文密码
-        hashed: 哈希后的密码（格式：salt:hash）
+        hashed: 哈希后的密码
 
     Returns:
         是否匹配
     """
     try:
-        salt, stored_hash = hashed.split(":")
-        pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
-        return pwd_hash == stored_hash
+        # 检查是否为新的 PBKDF2 格式
+        if hashed.startswith("pbkdf2_sha256$"):
+            parts = hashed.split("$")
+            if len(parts) != 4:
+                return False
+            iterations = int(parts[1])
+            salt = parts[2]
+            stored_hash = parts[3]
+            pwd_hash = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations
+            ).hex()
+            # 使用常量时间比较防止时序攻击
+            return hmac.compare_digest(pwd_hash, stored_hash)
+        else:
+            # 向后兼容：旧的 SHA-256 格式
+            salt, stored_hash = hashed.split(":")
+            pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+            # 使用常量时间比较防止时序攻击
+            return hmac.compare_digest(pwd_hash, stored_hash)
     except Exception:
         return False
 
@@ -669,6 +698,10 @@ class KeyManager:
 
         如果当前密钥超过轮换周期，则生成新密钥并标记旧密钥为不活跃。
 
+        性能说明：
+        - 使用 run_in_executor 将 CPU 密集型操作放到线程池执行
+        - 避免阻塞异步事件循环
+
         Returns:
             是否执行了轮换
         """
@@ -689,8 +722,10 @@ class KeyManager:
             # 标记当前密钥为不活跃
             current_key["is_active"] = False
 
-            # 生成新密钥
-            new_key_id = self._generate_new_key()
+            # 使用 run_in_executor 将 CPU 密集型操作放到线程池执行
+            # 避免阻塞异步事件循环
+            loop = asyncio.get_event_loop()
+            new_key_id = await loop.run_in_executor(None, self._generate_new_key)
 
             # 清理过期的旧密钥
             await self._cleanup_old_keys()
@@ -1079,10 +1114,20 @@ class ClientManager:
         return self._clients.get(client_id)
 
     def verify_client(self, client_id: str, client_secret: str) -> bool:
+        """验证客户端凭据
+
+        安全说明：
+        - 使用 hmac.compare_digest 进行常量时间比较，防止时序攻击
+        - 即使客户端不存在，也执行一次虚拟比较，确保时间一致
+        """
         client = self._clients.get(client_id)
         if not client:
+            # 执行虚拟比较，防止时序攻击（攻击者通过响应时间判断 client_id 是否存在）
+            hmac.compare_digest("dummy_secret", client_secret)
             return False
-        return client.get("client_secret") == client_secret
+        stored_secret = client.get("client_secret", "")
+        # 使用常量时间比较防止时序攻击
+        return hmac.compare_digest(client_secret, stored_secret)
 
     def add_client(
         self,
@@ -1153,8 +1198,13 @@ class ClientManager:
         return secrets.token_urlsafe(32)
 
     def generate_client_name(self) -> str:
+        """生成客户端名称
+
+        安全说明：
+        - 使用 secrets.choice 替代 random.choices，确保密码学安全
+        """
         chars = string.ascii_letters + string.digits
-        return f"OIDC_{''.join(random.choices(chars, k=5))}"
+        return f"OIDC_{''.join(secrets.choice(chars) for _ in range(5))}"
 
 
 class OIDCServer:
@@ -1323,7 +1373,13 @@ class OIDCServer:
         return self.config_manager.get(key, default)
 
     def _generate_code(self, length: int = 6) -> str:
-        return "".join(random.choices(string.digits, k=length))
+        """生成验证码
+
+        安全说明：
+        - 使用 secrets.choice 替代 random.choices，确保密码学安全
+        - secrets 模块使用操作系统提供的安全随机数源
+        """
+        return "".join(secrets.choice(string.digits) for _ in range(length))
 
     def _generate_token(self) -> str:
         return secrets.token_urlsafe(32)
@@ -1930,6 +1986,7 @@ class WebHandler:
         self.client_manager = client_manager
         self.audit_log_manager = audit_log_manager
         self.sessions: dict[str, dict] = {}
+        self._lock = asyncio.Lock()  # 用于保护会话操作
 
         # 速率限制告警回调函数
         async def on_rate_limit_triggered(identifier: str, ip: str, attempts: int):
@@ -2013,18 +2070,22 @@ class WebHandler:
             except asyncio.CancelledError:
                 pass
 
-    def _validate_session(self, token: str) -> bool:
-        """验证 session 是否有效（未过期）"""
-        if token not in self.sessions:
-            return False
-        session = self.sessions[token]
-        created_at = session.get("created_at", 0)
-        if time.time() - created_at > self.SESSION_EXPIRE_SECONDS:
-            # Session 已过期，删除
-            del self.sessions[token]
-            logger.info(f"Session 已过期并删除: {token[:10]}...")
-            return False
-        return True
+    async def _validate_session(self, token: str) -> bool:
+        """验证 session 是否有效（未过期）
+
+        使用锁保护，防止并发竞争条件。
+        """
+        async with self._lock:
+            session = self.sessions.get(token)
+            if not session:
+                return False
+            created_at = session.get("created_at", 0)
+            if time.time() - created_at > self.SESSION_EXPIRE_SECONDS:
+                # Session 已过期，删除
+                self.sessions.pop(token, None)  # 使用 pop 避免 KeyError
+                logger.info(f"Session 已过期并删除: {token[:10]}...")
+                return False
+            return True
 
     def _get_config(self, key: str, default=None):
         return self.plugin._get_config(key, default)
@@ -2280,7 +2341,7 @@ class WebHandler:
         - 无效的 token 返回 401 错误
         """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2304,7 +2365,7 @@ class WebHandler:
 
     async def handle_api_config(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2333,7 +2394,7 @@ class WebHandler:
         对输入数据进行验证，确保配置值合法。
         """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2445,7 +2506,7 @@ class WebHandler:
         返回当前活跃的认证会话信息，用于管理后台监控。
         """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2478,7 +2539,7 @@ class WebHandler:
         兼容旧数据格式（单 URL 转为列表）。
         """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2514,7 +2575,7 @@ class WebHandler:
 
     async def handle_api_clients_add(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2576,7 +2637,7 @@ class WebHandler:
 
     async def handle_api_clients_update(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2636,7 +2697,7 @@ class WebHandler:
 
     async def handle_api_clients_delete(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2672,7 +2733,7 @@ class WebHandler:
 
     async def handle_api_logs(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
@@ -2702,7 +2763,7 @@ class WebHandler:
 
     async def handle_api_logs_clear(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not self._validate_session(token):
+        if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )

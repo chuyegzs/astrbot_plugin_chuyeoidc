@@ -14,7 +14,6 @@ import html
 import os
 import re
 from collections.abc import Callable
-from typing import Any, Optional
 
 
 def escape_html(text: str) -> str:
@@ -153,6 +152,8 @@ class TemplateManager:
         警告：此方法不进行自动转义，调用者需要确保所有变量已经过适当转义。
         建议使用 render_safe 方法进行安全渲染。
 
+        注意：使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突。
+
         Args:
             template_name: 模板文件名（不含扩展名）
             **kwargs: 模板变量
@@ -161,7 +162,12 @@ class TemplateManager:
             渲染后的 HTML 字符串
         """
         template = self.get_template(template_name)
-        return template.format(**kwargs)
+        # 使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突
+        result = template
+        for key, value in kwargs.items():
+            placeholder = f"{{{key}}}"
+            result = result.replace(placeholder, str(value))
+        return result
 
     def render_safe(
         self, template_name: str, escape_mode: str = "html", **kwargs
@@ -187,20 +193,21 @@ class TemplateManager:
             )
 
         escape_func = self._escape_functions[escape_mode]
-        safe_kwargs = {}
 
-        for key, value in kwargs.items():
-            if isinstance(value, str):
-                safe_kwargs[key] = escape_func(value)
-            elif isinstance(value, (int, float, bool)):
-                safe_kwargs[key] = value
-            elif value is None:
-                safe_kwargs[key] = ""
-            else:
-                safe_kwargs[key] = escape_func(str(value))
-
+        # 使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突
         template = self.get_template(template_name)
-        return template.format(**safe_kwargs)
+        result = template
+        for key, value in kwargs.items():
+            placeholder = f"{{{key}}}"
+            if isinstance(value, str):
+                result = result.replace(placeholder, escape_func(value))
+            elif isinstance(value, (int, float, bool)):
+                result = result.replace(placeholder, str(value))
+            elif value is None:
+                result = result.replace(placeholder, "")
+            else:
+                result = result.replace(placeholder, escape_func(str(value)))
+        return result
 
     def render_with_escapes(
         self, template_name: str, escape_map: dict[str, str], **kwargs
@@ -226,7 +233,9 @@ class TemplateManager:
                 color="#4f46e5"
             )
         """
-        safe_kwargs = {}
+        # 使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突
+        template = self.get_template(template_name)
+        result = template
 
         for key, value in kwargs.items():
             escape_mode = escape_map.get(key, "html")
@@ -235,18 +244,18 @@ class TemplateManager:
                 escape_mode = "html"
 
             escape_func = self._escape_functions[escape_mode]
+            placeholder = f"{{{key}}}"
 
             if isinstance(value, str):
-                safe_kwargs[key] = escape_func(value)
+                result = result.replace(placeholder, escape_func(value))
             elif isinstance(value, (int, float, bool)):
-                safe_kwargs[key] = value
+                result = result.replace(placeholder, str(value))
             elif value is None:
-                safe_kwargs[key] = ""
+                result = result.replace(placeholder, "")
             else:
-                safe_kwargs[key] = escape_func(str(value))
+                result = result.replace(placeholder, escape_func(str(value)))
 
-        template = self.get_template(template_name)
-        return template.format(**safe_kwargs)
+        return result
 
     def clear_cache(self):
         """清除模板缓存"""
