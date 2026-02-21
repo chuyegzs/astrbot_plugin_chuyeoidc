@@ -24,5 +24,88 @@
     "type": "string",
     "hint": "Web管理后台的安全入口路径，不能为空，访问地址为 http://ip:端口/{安全入口}",
     "default": "chuyeoidc"
+  },
+  "jwt_settings": {
+    "description": "JWT 令牌设置",
+    "type": "object",
+    "hint": "配置 JWT 令牌的过期时间和签名算法",
+    "items": {
+      "access_token_expire": {
+        "description": "Access Token 有效期（分钟）",
+        "type": "int",
+        "hint": "Access Token 的有效期，默认60分钟",
+        "default": 60,
+        "minimum": 5,
+        "maximum": 1440
+      },
+      "refresh_token_expire": {
+        "description": "Refresh Token 有效期（天）",
+        "type": "int",
+        "hint": "Refresh Token 的有效期，默认30天",
+        "default": 30,
+        "minimum": 1,
+        "maximum": 365
+      },
+      "id_token_expire": {
+        "description": "ID Token 有效期（分钟）",
+        "type": "int",
+        "hint": "ID Token 的有效期，默认30分钟",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 480
+      },
+      "algorithm": {
+        "description": "JWT 签名算法",
+        "type": "string",
+        "hint": "JWT 签名算法，推荐使用 RS256（非对称加密），如需兼容旧客户端可使用 HS256（对称加密）",
+        "default": "RS256",
+        "options": ["RS256", "HS256"]
+      }
+    }
+  },
+  "security_settings": {
+    "description": "安全设置",
+    "type": "object",
+    "hint": "配置安全相关的选项",
+    "items": {
+      "session_timeout": {
+        "description": "管理后台会话超时（分钟）",
+        "type": "int",
+        "hint": "管理后台登录会话的超时时间，默认60分钟",
+        "default": 60,
+        "minimum": 10,
+        "maximum": 480
+      },
+      "max_login_attempts": {
+        "description": "最大登录尝试次数",
+        "type": "int",
+        "hint": "连续登录失败的最大次数，超过将被暂时锁定",
+        "default": 5,
+        "minimum": 3,
+        "maximum": 10
+      },
+      "lockout_duration": {
+        "description": "登录锁定时间（分钟）",
+        "type": "int",
+        "hint": "超过最大尝试次数后的锁定时间",
+        "default": 15,
+        "minimum": 5,
+        "maximum": 60
+      },
+      "enable_audit_log": {
+        "description": "启用审计日志",
+        "type": "bool",
+        "hint": "是否记录关键操作日志（登录、授权、客户端管理等）",
+        "default": true
+      },
+      "max_audit_logs": {
+        "description": "最大审计日志条数",
+        "type": "int",
+        "hint": "审计日志的最大保留条数，超过将自动清理旧日志",
+        "default": 1000,
+        "minimum": 100,
+        "maximum": 10000
+      }
+    }
   }
 }

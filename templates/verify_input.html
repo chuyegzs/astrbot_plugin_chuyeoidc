@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OIDC 验证 - 输入验证码</title>
+    <link rel="icon" type="image/png" href="{favicon_url}">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {{
+            theme: {{
+                extend: {{
+                    colors: {{
+                        primary: '{theme_color}',
+                    }}
+                }}
+            }}
+        }}
+    </script>
+    <style>
+        body {{ font-family: 'Inter', -apple-system, sans-serif; }}
+        .glass {{ background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }}
+        .bg-primary {{ background-color: {theme_color}; }}
+        .text-primary {{ color: {theme_color}; }}
+        .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color}33; }}
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 bg-[radial-gradient(circle_at_top_left,_var(--tw-gradient-stops))] from-indigo-100 via-slate-50 to-teal-50">
+    <div class="max-w-md w-full">
+        <div class="glass rounded-[2.5rem] shadow-2xl shadow-primary/30 p-8 md:p-10 border border-white">
+            <div class="text-center mb-10">
+                <div class="inline-flex items-center justify-center w-16 h-16 mb-6">
+                    {icon_html}
+                </div>
+                <h1 class="text-3xl font-bold text-slate-800 tracking-tight">手动验证</h1>
+                <p class="text-slate-500 mt-2 font-medium">请输入验证码和您的用户 ID</p>
+            </div>
+
+            <form id="verifyForm" class="space-y-6">
+                <div>
+                    <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">验证码</label>
+                    <input type="text" id="code" name="code" value="{code}" required 
+                        class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400 font-mono text-lg tracking-wider"
+                        placeholder="请输入验证码">
+                </div>
+                <div>
+                    <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">用户 ID</label>
+                    <input type="text" id="userId" name="userId" required 
+                        class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400"
+                        placeholder="请输入您的 QQ 号或用户 ID">
+                </div>
+                <button type="submit" 
+                    class="w-full py-4 bg-primary hover:opacity-90 text-white rounded-2xl font-bold text-lg shadow-lg shadow-primary/30 transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+                    <span>立即验证</span>
+                </button>
+            </form>
+            
+            <div id="message" class="mt-6 text-center p-4 rounded-2xl text-sm font-bold hidden"></div>
+        </div>
+        <p class="text-center text-slate-400 text-sm mt-8">Powered by <a href="https://github.com/AstrBotDevs/AstrBot" target="_blank" class="text-primary hover:opacity-80">AstrBot</a> & <a href="https://www.chuyel.cn" target="_blank" class="text-primary hover:opacity-80">初叶🍂竹叶-Furry控</a></p>
+    </div>
+
+    <script>
+        var POLL_INTERVAL_MS = {poll_interval_ms};
+        
+        document.getElementById('verifyForm').addEventListener('submit', async (e) => {{
+            e.preventDefault();
+            const code = document.getElementById('code').value;
+            const userId = document.getElementById('userId').value;
+            const message = document.getElementById('message');
+            const btn = e.target.querySelector('button');
+            
+            btn.disabled = true;
+            const originalBtnContent = btn.innerHTML;
+            btn.innerHTML = '<svg class="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
+            
+            try {{
+                const response = await fetch('../api/verify', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ code, user_id: userId }})
+                }});
+                const data = await response.json();
+                
+                message.classList.remove('hidden', 'bg-teal-50', 'text-teal-600', 'bg-rose-50', 'text-rose-600');
+                
+                if (data.success) {{
+                    message.classList.add('bg-teal-50', 'text-teal-600');
+                    message.textContent = '验证成功！正在跳转...';
+                    if (data.redirect_url) {{
+                        setTimeout(() => {{ window.location.href = data.redirect_url; }}, 1500);
+                    }}
+                }} else {{
+                    message.classList.add('bg-rose-50', 'text-rose-600');
+                    message.textContent = data.message || '验证失败';
+                    btn.disabled = false;
+                    btn.innerHTML = originalBtnContent;
+                }}
+            }} catch (err) {{
+                message.classList.remove('hidden');
+                message.classList.add('bg-rose-50', 'text-rose-600');
+                message.textContent = '网络错误，请重试';
+                btn.disabled = false;
+                btn.innerHTML = originalBtnContent;
+            }}
+        }});
+    </script>
+</body>
+</html>

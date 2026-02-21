@@ -4,26 +4,51 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.2
+版本: v1.0.3
 """
 
 import asyncio
 import json
 import os
 import random
+import re
 import secrets
 import string
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urljoin
 
+import jwt
 from aiohttp import web
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+
+# 导入模板管理器
+try:
+    from .templates import template_manager
+except ImportError:
+    # 如果模板模块不存在，创建一个简单的模板管理器
+    class _TemplateManager:
+        def __init__(self):
+            self.templates_dir = os.path.join(os.path.dirname(__file__), "templates")
+
+        def get_template(self, template_name: str) -> str:
+            template_path = os.path.join(self.templates_dir, f"{template_name}.html")
+            if not os.path.exists(template_path):
+                raise FileNotFoundError(f"模板文件不存在: {template_path}")
+            with open(template_path, "r", encoding="utf-8") as f:
+                return f.read()
+
+        def render(self, template_name: str, **kwargs) -> str:
+            template = self.get_template(template_name)
+            return template.format(**kwargs)
+
+    template_manager = _TemplateManager()
 
 
 @dataclass
@@ -31,7 +56,8 @@ class AuthSession:
     """OIDC 认证会话数据类"""
 
     session_id: str
-    code: str
+    code: str  # 验证码（用户输入的短码）
+    auth_code: str  # OIDC 授权码（高熵随机字符串，用于交换 token）
     state: str
     redirect_uri: str
     created_at: float
@@ -49,6 +75,705 @@ class VerifyCode:
     session_id: str
     created_at: float
     used: bool = False
+
+
+class AuditLogManager:
+    """审计日志管理器
+
+    记录关键操作日志，包括登录、授权、客户端管理等操作。
+    数据存储在 AstrBot data 目录下，支持在管理后台查看。
+
+    性能优化特性：
+    - 按操作类型建立索引，加速过滤查询
+    - 批量保存机制，减少磁盘I/O
+    - 内存缓存，避免重复遍历
+    """
+
+    def __init__(self, data_dir: str):
+        self.logs_file = os.path.join(data_dir, "audit_logs.json")
+        self._logs: list = []
+        self._max_logs = 1000  # 最多保留1000条日志
+        self._action_index: dict[str, list] = {}  # 操作类型索引
+        self._pending_logs: list = []  # 待保存的日志
+        self._save_interval = 10  # 批量保存间隔（条）
+        self._lock = asyncio.Lock()
+        self._load_logs()
+        self._rebuild_index()
+
+    def _load_logs(self):
+        """加载现有日志"""
+        if os.path.exists(self.logs_file):
+            try:
+                with open(self.logs_file, "r", encoding="utf-8") as f:
+                    self._logs = json.load(f)
+            except Exception as e:
+                logger.error(f"加载审计日志失败: {e}")
+                self._logs = []
+        else:
+            self._logs = []
+
+    def _save_logs(self):
+        """保存日志到文件"""
+        try:
+            with open(self.logs_file, "w", encoding="utf-8") as f:
+                json.dump(self._logs, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存审计日志失败: {e}")
+
+    def _rebuild_index(self):
+        """重建操作类型索引"""
+        self._action_index = {}
+        for i, log in enumerate(self._logs):
+            action = log.get("action")
+            if action:
+                if action not in self._action_index:
+                    self._action_index[action] = []
+                self._action_index[action].append(i)
+
+    def _add_to_index(self, log_entry: dict, index: int):
+        """添加日志到索引"""
+        action = log_entry.get("action")
+        if action:
+            if action not in self._action_index:
+                self._action_index[action] = []
+            self._action_index[action].append(index)
+
+    async def _flush_pending_logs(self):
+        """批量保存待处理的日志"""
+        async with self._lock:
+            if not self._pending_logs:
+                return
+
+            # 将待处理日志添加到主日志列表
+            for log_entry in self._pending_logs:
+                self._logs.insert(0, log_entry)
+                self._add_to_index(log_entry, 0)
+
+            # 限制日志数量
+            if len(self._logs) > self._max_logs:
+                removed = self._logs[self._max_logs :]
+                self._logs = self._logs[: self._max_logs]
+                # 重建索引（因为删除了日志）
+                self._rebuild_index()
+
+            # 保存到文件
+            self._save_logs()
+
+            # 清空待处理列表
+            count = len(self._pending_logs)
+            self._pending_logs = []
+            logger.debug(f"批量保存了 {count} 条审计日志")
+
+    def log(self, action: str, details: str = "", user: str = "", ip: str = ""):
+        """记录一条审计日志
+
+        Args:
+            action: 操作类型，如 LOGIN, LOGOUT, CLIENT_ADD, CLIENT_UPDATE, CLIENT_DELETE, CONFIG_UPDATE, AUTHORIZE, TOKEN_EXCHANGE
+            details: 操作详情
+            user: 操作用户
+            ip: 操作者IP地址
+        """
+        # 对敏感信息进行脱敏处理
+        sanitized_details = LogSanitizer.sanitize(details)
+        sanitized_user = LogSanitizer.sanitize(user)
+
+        log_entry = {
+            "timestamp": time.time(),
+            "datetime": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "details": sanitized_details,
+            "user": sanitized_user,
+            "ip": ip,
+        }
+
+        # 添加到待处理列表
+        self._pending_logs.append(log_entry)
+
+        # 达到批量保存阈值时立即保存
+        if len(self._pending_logs) >= self._save_interval:
+            # 使用 create_task 异步执行保存
+            try:
+                asyncio.create_task(self._flush_pending_logs())
+            except RuntimeError:
+                # 如果没有事件循环，同步保存
+                self._logs.insert(0, log_entry)
+                self._add_to_index(log_entry, 0)
+                if len(self._logs) > self._max_logs:
+                    self._logs = self._logs[: self._max_logs]
+                    self._rebuild_index()
+                self._save_logs()
+                self._pending_logs = []
+
+    async def flush(self):
+        """强制保存所有待处理的日志"""
+        await self._flush_pending_logs()
+
+    def get_logs(
+        self, limit: int = 100, offset: int = 0, action_filter: str = None
+    ) -> list:
+        """获取日志列表
+
+        Args:
+            limit: 返回的最大条数
+            offset: 跳过前多少条
+            action_filter: 按操作类型过滤
+
+        Returns:
+            日志列表（使用索引加速过滤）
+        """
+        # 先刷新待处理日志
+        if self._pending_logs:
+            try:
+                asyncio.create_task(self._flush_pending_logs())
+            except RuntimeError:
+                pass
+
+        if action_filter and action_filter in self._action_index:
+            # 使用索引快速获取指定类型的日志
+            indices = self._action_index[action_filter]
+            filtered_logs = [self._logs[i] for i in indices]
+            return filtered_logs[offset : offset + limit]
+        elif action_filter:
+            # 索引中没有该类型，返回空列表
+            return []
+        else:
+            # 返回所有日志
+            return self._logs[offset : offset + limit]
+
+    def get_logs_count(self, action_filter: str = None) -> int:
+        """获取日志总数（使用索引加速）"""
+        if action_filter:
+            return len(self._action_index.get(action_filter, []))
+        return len(self._logs) + len(self._pending_logs)
+
+    def clear_logs(self):
+        """清空所有日志"""
+        self._logs = []
+        self._save_logs()
+
+
+class KeyManager:
+    """密钥管理器
+
+    管理 RSA 密钥对的生成、轮换和版本控制。
+    支持密钥轮换机制，定期更新密钥以提高安全性。
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        key_size: int = 2048,
+        rotation_days: int = 90,
+        keep_old_keys: int = 2,
+    ):
+        """初始化密钥管理器
+
+        Args:
+            data_dir: 数据目录路径
+            key_size: RSA 密钥长度（默认2048位）
+            rotation_days: 密钥轮换周期（天，默认90天）
+            keep_old_keys: 保留的旧密钥数量（默认2个）
+        """
+        self.data_dir = data_dir
+        self.key_size = key_size
+        self.rotation_days = rotation_days
+        self.keep_old_keys = keep_old_keys
+        self._keys: dict[
+            str, dict
+        ] = {}  # key_id -> {private_key, public_key, created_at, is_active}
+        self._current_key_id: str = ""
+        self._lock = asyncio.Lock()
+        self._load_keys()
+
+    def _load_keys(self):
+        """加载所有密钥"""
+        keys_file = os.path.join(self.data_dir, "keys.json")
+        if os.path.exists(keys_file):
+            try:
+                with open(keys_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._current_key_id = data.get("current_key_id", "")
+                    # 加载密钥元数据
+                    for key_id, key_info in data.get("keys", {}).items():
+                        private_key_path = os.path.join(
+                            self.data_dir, f"private_key_{key_id}.pem"
+                        )
+                        public_key_path = os.path.join(
+                            self.data_dir, f"public_key_{key_id}.pem"
+                        )
+                        if os.path.exists(private_key_path) and os.path.exists(
+                            public_key_path
+                        ):
+                            # 检查私钥文件权限
+                            try:
+                                file_mode = os.stat(private_key_path).st_mode
+                                if file_mode & 0o077 != 0:
+                                    logger.warning(
+                                        f"私钥文件 {private_key_path} 权限不安全，建议设置为 0600"
+                                    )
+                            except Exception as e:
+                                logger.warning(f"检查私钥文件权限失败: {e}")
+                            
+                            self._keys[key_id] = {
+                                "created_at": key_info.get("created_at", 0),
+                                "is_active": key_info.get("is_active", True),
+                            }
+                logger.info(
+                    f"已加载 {len(self._keys)} 个密钥，当前密钥: {self._current_key_id}"
+                )
+            except Exception as e:
+                logger.error(f"加载密钥配置失败: {e}")
+
+        # 如果没有密钥，生成新的
+        if not self._keys:
+            self._generate_new_key()
+
+    def _save_keys_config(self):
+        """保存密钥配置"""
+        keys_file = os.path.join(self.data_dir, "keys.json")
+        data = {
+            "current_key_id": self._current_key_id,
+            "keys": {
+                key_id: {
+                    "created_at": info["created_at"],
+                    "is_active": info["is_active"],
+                }
+                for key_id, info in self._keys.items()
+            },
+        }
+        try:
+            with open(keys_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存密钥配置失败: {e}")
+
+    def _generate_new_key(self) -> str:
+        """生成新的 RSA 密钥对
+
+        Returns:
+            新生成的密钥ID
+        """
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+
+        key_id = f"key_{int(time.time())}"
+        logger.info(f"生成新的 RSA 密钥对: {key_id}")
+
+        # 生成密钥
+        private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=self.key_size, backend=default_backend()
+        )
+        public_key = private_key.public_key()
+
+        # 保存私钥
+        private_key_path = os.path.join(self.data_dir, f"private_key_{key_id}.pem")
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        with open(private_key_path, "wb") as f:
+            f.write(private_pem)
+        
+        # 设置私钥文件权限为 0600（仅所有者可读写）
+        try:
+            os.chmod(private_key_path, 0o600)
+        except Exception as e:
+            logger.warning(f"设置私钥文件权限失败: {e}")
+
+        # 保存公钥
+        public_key_path = os.path.join(self.data_dir, f"public_key_{key_id}.pem")
+        public_pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        with open(public_key_path, "wb") as f:
+            f.write(public_pem)
+
+        # 更新密钥记录
+        self._keys[key_id] = {
+            "created_at": time.time(),
+            "is_active": True,
+        }
+        self._current_key_id = key_id
+        self._save_keys_config()
+
+        logger.info(f"新密钥已生成: {key_id}")
+        return key_id
+
+    def _load_key(self, key_id: str) -> tuple:
+        """加载指定密钥
+
+        Returns:
+            (private_key, public_key) 或 (None, None)
+        """
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.backends import default_backend
+
+        private_key_path = os.path.join(self.data_dir, f"private_key_{key_id}.pem")
+        public_key_path = os.path.join(self.data_dir, f"public_key_{key_id}.pem")
+
+        if not os.path.exists(private_key_path) or not os.path.exists(public_key_path):
+            return None, None
+
+        try:
+            with open(private_key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(
+                    f.read(), password=None, backend=default_backend()
+                )
+            with open(public_key_path, "rb") as f:
+                public_key = serialization.load_pem_public_key(
+                    f.read(), backend=default_backend()
+                )
+            return private_key, public_key
+        except Exception as e:
+            logger.error(f"加载密钥 {key_id} 失败: {e}")
+            return None, None
+
+    def get_current_key(self) -> tuple[str, Any, Any]:
+        """获取当前使用的密钥
+
+        Returns:
+            (key_id, private_key, public_key)
+        """
+        private_key, public_key = self._load_key(self._current_key_id)
+        if private_key is None:
+            # 当前密钥加载失败，生成新的
+            key_id = self._generate_new_key()
+            private_key, public_key = self._load_key(key_id)
+            return key_id, private_key, public_key
+        return self._current_key_id, private_key, public_key
+
+    def get_key(self, key_id: str) -> tuple[Any, Any]:
+        """获取指定密钥
+
+        Returns:
+            (private_key, public_key) 或 (None, None)
+        """
+        return self._load_key(key_id)
+
+    def get_all_public_keys(self) -> list[dict]:
+        """获取所有活跃的公钥（用于 JWKS）
+
+        Returns:
+            公钥列表，每个包含 key_id 和公钥对象
+        """
+        keys = []
+        for key_id, info in self._keys.items():
+            if info.get("is_active", True):
+                _, public_key = self._load_key(key_id)
+                if public_key:
+                    keys.append({"key_id": key_id, "public_key": public_key})
+        return keys
+
+    async def rotate_keys(self) -> bool:
+        """执行密钥轮换
+
+        如果当前密钥超过轮换周期，则生成新密钥并标记旧密钥为不活跃。
+
+        Returns:
+            是否执行了轮换
+        """
+        async with self._lock:
+            current_key = self._keys.get(self._current_key_id)
+            if not current_key:
+                return False
+
+            created_at = current_key.get("created_at", 0)
+            rotation_seconds = self.rotation_days * 24 * 3600
+
+            if time.time() - created_at < rotation_seconds:
+                # 未达到轮换时间
+                return False
+
+            logger.info("执行密钥轮换...")
+
+            # 标记当前密钥为不活跃
+            current_key["is_active"] = False
+
+            # 生成新密钥
+            new_key_id = self._generate_new_key()
+
+            # 清理过期的旧密钥
+            await self._cleanup_old_keys()
+
+            self._save_keys_config()
+            logger.info(f"密钥轮换完成，新密钥: {new_key_id}")
+            return True
+
+    async def _cleanup_old_keys(self):
+        """清理过期的旧密钥，只保留最近的几个"""
+        inactive_keys = [
+            (key_id, info)
+            for key_id, info in self._keys.items()
+            if not info.get("is_active", True)
+        ]
+
+        # 按创建时间排序，保留最新的
+        inactive_keys.sort(key=lambda x: x[1].get("created_at", 0), reverse=True)
+
+        keys_to_remove = inactive_keys[self.keep_old_keys :]
+        for key_id, _ in keys_to_remove:
+            logger.info(f"清理旧密钥: {key_id}")
+            del self._keys[key_id]
+
+            # 删除密钥文件
+            private_key_path = os.path.join(self.data_dir, f"private_key_{key_id}.pem")
+            public_key_path = os.path.join(self.data_dir, f"public_key_{key_id}.pem")
+            try:
+                if os.path.exists(private_key_path):
+                    os.remove(private_key_path)
+                if os.path.exists(public_key_path):
+                    os.remove(public_key_path)
+            except Exception as e:
+                logger.error(f"删除旧密钥文件失败 {key_id}: {e}")
+
+    def get_key_info(self) -> dict:
+        """获取密钥信息（用于管理后台显示）"""
+        current_key = self._keys.get(self._current_key_id, {})
+        return {
+            "current_key_id": self._current_key_id,
+            "total_keys": len(self._keys),
+            "active_keys": sum(
+                1 for k in self._keys.values() if k.get("is_active", True)
+            ),
+            "current_key_created": current_key.get("created_at", 0),
+            "rotation_days": self.rotation_days,
+            "next_rotation": current_key.get("created_at", 0)
+            + self.rotation_days * 24 * 3600,
+        }
+
+
+class LogSanitizer:
+    """日志脱敏工具
+
+    用于对日志中的敏感信息进行脱敏处理，防止敏感数据泄露。
+    """
+
+    # 敏感字段列表
+    SENSITIVE_FIELDS = [
+        "password",
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "secret",
+        "client_secret",
+        "code",
+        "auth_code",
+        "authorization",
+        "cookie",
+        "session",
+        "private_key",
+        "api_key",
+    ]
+
+    # 敏感模式（正则表达式）
+    SENSITIVE_PATTERNS = [
+        # JWT Token
+        (r"eyJ[a-zA-Z0-9_-]*\.eyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*", "[JWT_TOKEN]"),
+        # Bearer Token
+        (r"Bearer\s+[a-zA-Z0-9_-]+", "Bearer [TOKEN]"),
+        # API Key / Secret
+        (
+            r'(api[_-]?key|secret)["\']?\s*[:=]\s*["\']?[a-zA-Z0-9]{16,}',
+            r"\1=[REDACTED]",
+        ),
+        # 邮箱地址
+        (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "[EMAIL]"),
+        # IP地址（可选脱敏）
+        (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[IP]"),
+    ]
+
+    @classmethod
+    def sanitize(cls, message: str) -> str:
+        """对日志消息进行脱敏处理
+
+        Args:
+            message: 原始日志消息
+
+        Returns:
+            脱敏后的消息
+        """
+        if not isinstance(message, str):
+            message = str(message)
+
+        result = message
+
+        # 应用正则表达式脱敏
+        for pattern, replacement in cls.SENSITIVE_PATTERNS:
+            try:
+                result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+            except re.error:
+                continue
+
+        return result
+
+    @classmethod
+    def sanitize_dict(cls, data: dict, max_depth: int = 3) -> dict:
+        """对字典中的敏感字段进行脱敏
+
+        Args:
+            data: 原始字典
+            max_depth: 最大递归深度
+
+        Returns:
+            脱敏后的字典副本
+        """
+        if max_depth <= 0:
+            return data
+
+        result = {}
+        for key, value in data.items():
+            key_lower = str(key).lower()
+
+            # 检查是否为敏感字段
+            is_sensitive = any(
+                sensitive in key_lower for sensitive in cls.SENSITIVE_FIELDS
+            )
+
+            if is_sensitive:
+                if isinstance(value, str):
+                    if len(value) > 8:
+                        result[key] = value[:4] + "****" + value[-4:]
+                    else:
+                        result[key] = "****"
+                else:
+                    result[key] = "[REDACTED]"
+            elif isinstance(value, dict):
+                result[key] = cls.sanitize_dict(value, max_depth - 1)
+            elif isinstance(value, list):
+                result[key] = cls.sanitize_list(value, max_depth - 1)
+            else:
+                result[key] = value
+
+        return result
+
+    @classmethod
+    def sanitize_list(cls, data: list, max_depth: int = 3) -> list:
+        """对列表中的敏感数据进行脱敏"""
+        if max_depth <= 0:
+            return data
+
+        result = []
+        for item in data:
+            if isinstance(item, dict):
+                result.append(cls.sanitize_dict(item, max_depth - 1))
+            elif isinstance(item, list):
+                result.append(cls.sanitize_list(item, max_depth - 1))
+            else:
+                result.append(item)
+        return result
+
+
+class SessionManager:
+    """会话管理器
+
+    管理 OIDC 认证会话、验证码和访问令牌的持久化存储。
+    数据存储在 AstrBot data 目录下，重启后不会丢失。
+    """
+
+    def __init__(self, data_dir: str):
+        self.sessions_file = os.path.join(data_dir, "sessions.json")
+        self.verify_codes_file = os.path.join(data_dir, "verify_codes.json")
+        self.access_tokens_file = os.path.join(data_dir, "access_tokens.json")
+        self._sessions: dict = {}
+        self._verify_codes: dict = {}
+        self._access_tokens: dict = {}
+        self._lock = asyncio.Lock()
+        self._load_all()
+
+    def _load_all(self):
+        """加载所有会话数据"""
+        self._sessions = self._load_json(self.sessions_file)
+        self._verify_codes = self._load_json(self.verify_codes_file)
+        self._access_tokens = self._load_json(self.access_tokens_file)
+        logger.info(
+            f"已加载会话数据: {len(self._sessions)} 个会话, "
+            f"{len(self._verify_codes)} 个验证码, {len(self._access_tokens)} 个令牌"
+        )
+
+    def _load_json(self, filepath: str) -> dict:
+        """加载 JSON 文件"""
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data
+            except Exception as e:
+                logger.error(f"加载文件失败 {filepath}: {e}")
+                return {}
+        return {}
+
+    def _save_json(self, filepath: str, data: dict):
+        """保存 JSON 文件"""
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            logger.error(f"保存文件失败 {filepath}: {e}")
+
+    async def save_sessions(self):
+        """保存会话数据（异步）"""
+        async with self._lock:
+            self._save_json(self.sessions_file, self._sessions)
+
+    async def save_verify_codes(self):
+        """保存验证码数据（异步）"""
+        async with self._lock:
+            self._save_json(self.verify_codes_file, self._verify_codes)
+
+    async def save_access_tokens(self):
+        """保存访问令牌数据（异步）"""
+        async with self._lock:
+            self._save_json(self.access_tokens_file, self._access_tokens)
+
+    async def save_all(self):
+        """保存所有数据"""
+        async with self._lock:
+            self._save_json(self.sessions_file, self._sessions)
+            self._save_json(self.verify_codes_file, self._verify_codes)
+            self._save_json(self.access_tokens_file, self._access_tokens)
+
+    # 会话操作
+    def get_session(self, session_id: str) -> Optional[dict]:
+        return self._sessions.get(session_id)
+
+    def set_session(self, session_id: str, session_data: dict):
+        self._sessions[session_id] = session_data
+
+    def delete_session(self, session_id: str):
+        self._sessions.pop(session_id, None)
+
+    def get_all_sessions(self) -> dict:
+        return self._sessions.copy()
+
+    # 验证码操作
+    def get_verify_code(self, code: str) -> Optional[dict]:
+        return self._verify_codes.get(code)
+
+    def set_verify_code(self, code: str, verify_data: dict):
+        self._verify_codes[code] = verify_data
+
+    def delete_verify_code(self, code: str):
+        self._verify_codes.pop(code, None)
+
+    def get_all_verify_codes(self) -> dict:
+        return self._verify_codes.copy()
+
+    # 访问令牌操作
+    def get_access_token(self, token: str) -> Optional[dict]:
+        return self._access_tokens.get(token)
+
+    def set_access_token(self, token: str, token_data: dict):
+        self._access_tokens[token] = token_data
+
+    def delete_access_token(self, token: str):
+        self._access_tokens.pop(token, None)
+
+    def get_all_access_tokens(self) -> dict:
+        return self._access_tokens.copy()
 
 
 class ConfigManager:
@@ -76,7 +801,8 @@ class ConfigManager:
             "code_length": 6,
             "theme_color": "#4f46e5",
             "icon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
-            "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
+            "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%BA%95.png",
+            "jwt_secret": "",  # JWT 签名密钥，留空则自动生成
         }
 
         if os.path.exists(self.config_file):
@@ -166,8 +892,8 @@ class ClientManager:
         client_id: str,
         client_secret: str,
         name: str = "",
-        home_url: str = "",
-        redirect_url: str = "",
+        home_urls: list = None,
+        redirect_urls: list = None,
     ) -> bool:
         if client_id in self._clients:
             return False
@@ -175,8 +901,8 @@ class ClientManager:
             "client_id": client_id,
             "client_secret": client_secret,
             "name": name or client_id,
-            "home_url": home_url,
-            "redirect_url": redirect_url,
+            "home_urls": home_urls if home_urls else [],
+            "redirect_urls": redirect_urls if redirect_urls else [],
             "created_at": time.time(),
         }
         return self._save_clients()
@@ -186,8 +912,8 @@ class ClientManager:
         client_id: str,
         client_secret: str = None,
         name: str = None,
-        home_url: str = None,
-        redirect_url: str = None,
+        home_urls: list = None,
+        redirect_urls: list = None,
     ) -> bool:
         if client_id not in self._clients:
             return False
@@ -195,11 +921,24 @@ class ClientManager:
             self._clients[client_id]["client_secret"] = client_secret
         if name is not None:
             self._clients[client_id]["name"] = name
-        if home_url is not None:
-            self._clients[client_id]["home_url"] = home_url
-        if redirect_url is not None:
-            self._clients[client_id]["redirect_url"] = redirect_url
+        if home_urls is not None:
+            self._clients[client_id]["home_urls"] = home_urls
+        if redirect_urls is not None:
+            self._clients[client_id]["redirect_urls"] = redirect_urls
         return self._save_clients()
+
+    def verify_redirect_uri(self, client_id: str, redirect_uri: str) -> bool:
+        """验证 redirect_uri 是否匹配客户端注册的任一 redirect_url"""
+        client = self._clients.get(client_id)
+        if not client:
+            return False
+        redirect_urls = client.get("redirect_urls", [])
+        if not redirect_urls:
+            # 兼容旧数据，使用单个 redirect_url
+            old_url = client.get("redirect_url", "")
+            if old_url:
+                redirect_urls = [old_url]
+        return redirect_uri in redirect_urls
 
     def delete_client(self, client_id: str) -> bool:
         if client_id not in self._clients:
@@ -232,18 +971,136 @@ class OIDCServer:
     """
 
     def __init__(
-        self, plugin, config_manager: ConfigManager, client_manager: ClientManager
+        self,
+        plugin,
+        config_manager: ConfigManager,
+        client_manager: ClientManager,
+        session_manager: SessionManager,
     ):
         self.plugin = plugin
         self.config_manager = config_manager
         self.client_manager = client_manager
+        self.session_manager = session_manager
         self.app: Optional[web.Application] = None
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
-        self.sessions: dict[str, AuthSession] = {}
-        self.verify_codes: dict[str, VerifyCode] = {}
-        self.access_tokens: dict[str, dict] = {}
         self._lock = asyncio.Lock()
+        self._jwt_algorithm = "RS256"  # 使用 RS256 非对称加密
+        # 初始化密钥管理器
+        self.key_manager = KeyManager(
+            data_dir=self.config_manager.data_dir,
+            key_size=2048,
+            rotation_days=90,
+            keep_old_keys=2,
+        )
+        # 启动自动保存任务
+        self._save_task: Optional[asyncio.Task] = None
+        self._start_auto_save()
+
+    def _get_rsa_private_key_pem(self) -> str:
+        """获取 RSA 私钥 PEM 格式（用于 JWT 签名）"""
+        from cryptography.hazmat.primitives import serialization
+
+        _, private_key, _ = self.key_manager.get_current_key()
+        return private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode("utf-8")
+
+    def _get_rsa_public_key_pem(self) -> str:
+        """获取 RSA 公钥 PEM 格式"""
+        from cryptography.hazmat.primitives import serialization
+
+        _, _, public_key = self.key_manager.get_current_key()
+        return public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+
+    def _get_jwks_keys(self) -> list[dict]:
+        """获取 JWKS 格式的所有活跃公钥（不包含私钥信息）"""
+        from cryptography.hazmat.primitives import serialization
+        import base64
+
+        def int_to_base64url(value: int) -> str:
+            """将整数转换为 Base64URL 编码"""
+            byte_length = (value.bit_length() + 7) // 8
+            bytes_value = value.to_bytes(byte_length, "big")
+            return base64.urlsafe_b64encode(bytes_value).decode("ascii").rstrip("=")
+
+        keys = []
+        all_public_keys = self.key_manager.get_all_public_keys()
+
+        for key_info in all_public_keys:
+            key_id = key_info["key_id"]
+            public_key = key_info["public_key"]
+
+            # 获取公钥的原始组件
+            public_numbers = public_key.public_numbers()
+            n = public_numbers.n
+            e = public_numbers.e
+
+            keys.append(
+                {
+                    "kty": "RSA",
+                    "kid": key_id,
+                    "alg": self._jwt_algorithm,
+                    "use": "sig",
+                    "n": int_to_base64url(n),
+                    "e": int_to_base64url(e),
+                }
+            )
+
+        return keys
+
+    def _get_jwks_key(self) -> dict:
+        """获取当前使用的 JWKS 格式公钥（向后兼容）"""
+        keys = self._get_jwks_keys()
+        if keys:
+            return keys[0]  # 返回第一个（当前）密钥
+        return {}
+
+    def _start_auto_save(self):
+        """启动自动保存任务，每30秒保存一次会话数据"""
+
+        async def auto_save():
+            while True:
+                try:
+                    await asyncio.sleep(30)  # 每30秒保存一次
+                    await self.session_manager.save_all()
+                    logger.debug("会话数据已自动保存")
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"自动保存会话数据失败: {e}")
+
+        self._save_task = asyncio.create_task(auto_save())
+
+    def stop_auto_save(self):
+        """停止自动保存任务"""
+        if self._save_task:
+            self._save_task.cancel()
+
+    async def save_all_data(self):
+        """立即保存所有会话数据"""
+        await self.session_manager.save_all()
+
+    # 数据访问属性（兼容旧代码）
+    @property
+    def sessions(self) -> dict:
+        """获取所有会话（从 SessionManager 加载）"""
+        return self.session_manager.get_all_sessions()
+
+    @property
+    def verify_codes(self) -> dict:
+        """获取所有验证码（从 SessionManager 加载）"""
+        return self.session_manager.get_all_verify_codes()
+
+    @property
+    def access_tokens(self) -> dict:
+        """获取所有访问令牌（从 SessionManager 加载）"""
+        return self.session_manager.get_all_access_tokens()
 
     def _get_config(self, key: str, default=None):
         return self.plugin._get_config(key, default)
@@ -257,33 +1114,119 @@ class OIDCServer:
     def _generate_token(self) -> str:
         return secrets.token_urlsafe(32)
 
+    def _generate_id_token(self, session: AuthSession) -> str:
+        """生成标准 JWT 格式的 id_token
+
+        遵循 OIDC 规范，包含必要的 claims：
+        - iss: 签发者
+        - sub: 用户唯一标识
+        - aud: 受众（client_id）
+        - exp: 过期时间
+        - iat: 签发时间
+        - auth_time: 认证时间
+        """
+        now = datetime.now(timezone.utc)
+        expires = now.timestamp() + 3600  # 1小时过期
+
+        payload = {
+            "iss": "https://chuyeoidc.astrbot",
+            "sub": session.verified_user_id or "",
+            "aud": session.client_id or "",
+            "exp": expires,
+            "iat": now.timestamp(),
+            "auth_time": now.timestamp(),
+            # 可选 claims
+            "name": session.user_info.get("name", ""),
+            "nickname": session.user_info.get("nickname", ""),
+            "email": session.user_info.get("email", ""),
+        }
+
+        # 获取当前密钥ID用于JWT头部
+        current_key_id, _, _ = self.key_manager.get_current_key()
+        token = jwt.encode(
+            payload,
+            self._get_rsa_private_key_pem(),
+            algorithm=self._jwt_algorithm,
+            headers={"kid": current_key_id},
+        )
+        return token
+
     async def create_auth_session(
         self, redirect_uri: str, state: str, client_id: str = ""
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         session_id = str(uuid.uuid4())
         code_length = self._get_web_config("code_length", 6)
         verify_code = self._generate_code(code_length)
+        # 生成高熵 OIDC 授权码（与验证码分离）
+        auth_code = secrets.token_urlsafe(32)
 
-        logger.info(f"创建认证会话: session_id={session_id}, verify_code={verify_code}")
+        logger.info(f"创建认证会话: session_id={session_id[:8]}...")
 
         async with self._lock:
             session = AuthSession(
                 session_id=session_id,
                 code=verify_code,
+                auth_code=auth_code,
                 state=state,
                 redirect_uri=redirect_uri,
                 created_at=time.time(),
                 client_id=client_id,
             )
-            self.sessions[session_id] = session
-            self.verify_codes[verify_code] = VerifyCode(
-                code=verify_code, session_id=session_id, created_at=time.time()
+            # 使用 SessionManager 存储会话
+            self.session_manager.set_session(session_id, self._session_to_dict(session))
+            self.session_manager.set_verify_code(
+                verify_code,
+                {
+                    "code": verify_code,
+                    "session_id": session_id,
+                    "created_at": time.time(),
+                    "used": False,
+                },
             )
             logger.info(
                 f"会话已存储: sessions count={len(self.sessions)}, verify_codes count={len(self.verify_codes)}"
             )
 
-        return session_id, verify_code
+        return session_id, verify_code, auth_code
+
+    def _session_to_dict(self, session: AuthSession) -> dict:
+        """将 AuthSession 转换为字典"""
+        return {
+            "session_id": session.session_id,
+            "code": session.code,
+            "auth_code": session.auth_code,
+            "state": session.state,
+            "redirect_uri": session.redirect_uri,
+            "created_at": session.created_at,
+            "client_id": session.client_id,
+            "verified": session.verified,
+            "verified_user_id": session.verified_user_id,
+            "user_info": session.user_info,
+        }
+
+    def _dict_to_session(self, data: dict) -> AuthSession:
+        """将字典转换为 AuthSession"""
+        return AuthSession(
+            session_id=data["session_id"],
+            code=data["code"],
+            auth_code=data["auth_code"],
+            state=data["state"],
+            redirect_uri=data["redirect_uri"],
+            created_at=data["created_at"],
+            client_id=data.get("client_id", ""),
+            verified=data.get("verified", False),
+            verified_user_id=data.get("verified_user_id"),
+            user_info=data.get("user_info", {}),
+        )
+
+    def _dict_to_verify_code(self, data: dict) -> VerifyCode:
+        """将字典转换为 VerifyCode"""
+        return VerifyCode(
+            code=data["code"],
+            session_id=data["session_id"],
+            created_at=data["created_at"],
+            used=data.get("used", False),
+        )
 
     async def verify_code_submit(
         self, code: str, user_id: str, user_info: dict = None
@@ -291,93 +1234,180 @@ class OIDCServer:
         expire_seconds = self._get_web_config("code_expire_seconds", 300)
 
         async with self._lock:
-            if code not in self.verify_codes:
-                logger.warning(
-                    f"验证码不存在: {code}, 已有验证码: {list(self.verify_codes.keys())}"
-                )
+            verify_code_data = self.session_manager.get_verify_code(code)
+            if not verify_code_data:
+                logger.warning(f"验证码不存在: {code[:3]}...")
                 return False, "验证码不存在"
 
-            verify_code = self.verify_codes[code]
+            verify_code = self._dict_to_verify_code(verify_code_data)
 
             if verify_code.used:
                 return False, "验证码已使用"
 
             if time.time() - verify_code.created_at > expire_seconds:
-                del self.verify_codes[code]
-                if verify_code.session_id in self.sessions:
-                    del self.sessions[verify_code.session_id]
+                self.session_manager.delete_verify_code(code)
+                self.session_manager.delete_session(verify_code.session_id)
                 return False, "验证码已过期"
 
-            verify_code.used = True
-            session = self.sessions.get(verify_code.session_id)
-            logger.info(
-                f"验证码提交: session_id={verify_code.session_id}, session存在={session is not None}, sessions keys={list(self.sessions.keys())}"
-            )
-            if session:
-                session.verified = True
-                session.verified_user_id = user_id
-                session.user_info = user_info or {"id": user_id, "name": user_id}
-                logger.info(
-                    f"验证成功: session {verify_code.session_id} 已标记为 verified=True, user_info={session.user_info}"
-                )
+            # 更新验证码状态
+            verify_code_data["used"] = True
+            self.session_manager.set_verify_code(code, verify_code_data)
+
+            # 更新会话状态
+            session_data = self.session_manager.get_session(verify_code.session_id)
+            if session_data:
+                session_data["verified"] = True
+                session_data["verified_user_id"] = user_id
+                session_data["user_info"] = user_info or {
+                    "id": user_id,
+                    "name": user_id,
+                }
+                self.session_manager.set_session(verify_code.session_id, session_data)
+                logger.info(f"验证成功: session_id={verify_code.session_id[:8]}...")
             else:
-                logger.error(f"Session不存在: session_id={verify_code.session_id}")
+                logger.error(
+                    f"Session不存在: session_id={verify_code.session_id[:8]}..."
+                )
 
             return True, verify_code.session_id
 
     async def get_session(self, session_id: str) -> Optional[AuthSession]:
         logger.info(
-            f"get_session: session_id={session_id}, sessions count={len(self.sessions)}, keys={list(self.sessions.keys())[:5]}"
+            f"get_session: session_id={session_id[:8]}..., sessions count={len(self.sessions)}, keys={list(self.sessions.keys())[:5]}"
         )
-        return self.sessions.get(session_id)
+        session_data = self.session_manager.get_session(session_id)
+        if session_data:
+            return self._dict_to_session(session_data)
+        return None
 
     async def exchange_code(self, code: str, client_id: str = "") -> Optional[dict]:
-        logger.info(f"exchange_code: code={code}, client_id={client_id}")
+        logger.info(f"exchange_code: client_id={client_id}")
         async with self._lock:
             session = None
-            for s in self.sessions.values():
-                logger.info(
-                    f"检查session: session.code={s.code}, verified={s.verified}"
-                )
-                if s.code == code and s.verified:
-                    session = s
+            # 遍历所有会话查找匹配的 auth_code
+            for session_id, session_data in self.sessions.items():
+                # 使用 auth_code（高熵授权码）而不是 code（验证码）
+                if session_data.get("auth_code") == code and session_data.get(
+                    "verified"
+                ):
+                    session = self._dict_to_session(session_data)
                     break
 
             if not session:
-                logger.warning(f"未找到匹配的session: code={code}")
+                logger.warning("未找到匹配的session")
                 return None
 
             if client_id and session.client_id and session.client_id != client_id:
                 logger.warning(
-                    f"client_id不匹配: session.client_id={session.client_id}, 请求client_id={client_id}"
+                    f"client_id不匹配: expected={session.client_id[:8] if session.client_id else 'any'}..., got={client_id[:8]}..."
                 )
                 return None
 
             access_token = self._generate_token()
-            id_token = self._generate_token()
+            refresh_token = self._generate_token()
+            # 使用 JWT 格式的 id_token
+            id_token = self._generate_id_token(session)
 
             token_data = {
                 "access_token": access_token,
                 "token_type": "Bearer",
                 "expires_in": 3600,
+                "refresh_token": refresh_token,
                 "id_token": id_token,
-                "user_id": session.verified_user_id,
-                "user_info": session.user_info,
             }
-            self.access_tokens[access_token] = token_data
-            self.access_tokens[id_token] = token_data
-
-            logger.info(
-                f"Token交换成功: access_token={access_token[:20]}..., user_info={session.user_info}"
+            # 使用 SessionManager 存储令牌
+            self.session_manager.set_access_token(
+                access_token,
+                {
+                    **token_data,
+                    "created_at": time.time(),
+                    "user_id": session.verified_user_id,
+                    "user_info": session.user_info,
+                    "client_id": client_id,
+                },
             )
+            # 存储 refresh_token 关联信息
+            self.session_manager.set_access_token(
+                refresh_token,
+                {
+                    "type": "refresh_token",
+                    "access_token": access_token,
+                    "user_id": session.verified_user_id,
+                    "user_info": session.user_info,
+                    "client_id": client_id,
+                    "created_at": time.time(),
+                },
+            )
+
+            logger.info(f"Token交换成功: client_id={client_id}")
             return token_data
 
+    async def exchange_refresh_token(
+        self, refresh_token: str, client_id: str = ""
+    ) -> Optional[dict]:
+        """使用 refresh_token 换取新的 access_token"""
+        async with self._lock:
+            token_data = self.session_manager.get_access_token(refresh_token)
+            if not token_data or token_data.get("type") != "refresh_token":
+                return None
+
+            # 验证 client_id
+            if (
+                client_id
+                and token_data.get("client_id")
+                and token_data.get("client_id") != client_id
+            ):
+                return None
+
+            # 检查 refresh_token 是否过期（30天）
+            if time.time() - token_data.get("created_at", 0) > 30 * 24 * 3600:
+                self.session_manager.delete_access_token(refresh_token)
+                return None
+
+            # 生成新的 token
+            new_access_token = self._generate_token()
+            new_refresh_token = self._generate_token()
+
+            user_id = token_data.get("user_id", "")
+            user_info = token_data.get("user_info", {})
+            stored_client_id = token_data.get("client_id", "")
+
+            # 删除旧的 refresh_token
+            self.session_manager.delete_access_token(refresh_token)
+
+            # 存储新的 token
+            new_token_data = {
+                "access_token": new_access_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": new_refresh_token,
+            }
+            self.session_manager.set_access_token(
+                new_access_token,
+                {
+                    **new_token_data,
+                    "created_at": time.time(),
+                    "user_id": user_id,
+                    "user_info": user_info,
+                    "client_id": stored_client_id,
+                },
+            )
+            self.session_manager.set_access_token(
+                new_refresh_token,
+                {
+                    "type": "refresh_token",
+                    "access_token": new_access_token,
+                    "user_id": user_id,
+                    "user_info": user_info,
+                    "client_id": stored_client_id,
+                    "created_at": time.time(),
+                },
+            )
+
+            return new_token_data
+
     async def get_user_info(self, token: str) -> Optional[dict]:
-        result = self.access_tokens.get(token)
-        logger.info(
-            f"get_user_info: token={token[:20] if token else 'None'}..., found={result is not None}, data={result}"
-        )
-        return result
+        return self.session_manager.get_access_token(token)
 
     async def cleanup_expired(self):
         expire_seconds = self._get_web_config("code_expire_seconds", 300)
@@ -387,12 +1417,13 @@ class OIDCServer:
             expired_codes = [
                 code
                 for code, vc in self.verify_codes.items()
-                if current_time - vc.created_at > expire_seconds
+                if current_time - vc.get("created_at", 0) > expire_seconds
             ]
             for code in expired_codes:
-                vc = self.verify_codes.pop(code, None)
-                if vc and vc.session_id in self.sessions:
-                    del self.sessions[vc.session_id]
+                vc = self.session_manager.get_verify_code(code)
+                self.session_manager.delete_verify_code(code)
+                if vc and vc.get("session_id"):
+                    self.session_manager.delete_session(vc["session_id"])
 
             expired_tokens = [
                 token
@@ -400,12 +1431,141 @@ class OIDCServer:
                 if current_time - data.get("created_at", current_time) > 3600
             ]
             for token in expired_tokens:
-                del self.access_tokens[token]
+                self.session_manager.delete_access_token(token)
 
         if expired_codes or expired_tokens:
             logger.debug(
                 f"清理过期数据: {len(expired_codes)} 个验证码, {len(expired_tokens)} 个令牌"
             )
+
+        # 保存清理后的数据
+        await self.session_manager.save_all()
+
+
+class RateLimiter:
+    """速率限制器
+
+    用于限制登录尝试频率，防止暴力破解攻击。
+    支持基于 IP 和用户的速率限制。
+    """
+
+    def __init__(
+        self,
+        max_attempts: int = 5,
+        lockout_duration: int = 900,
+        window_size: int = 300,
+        on_rate_limit_triggered: callable = None,
+    ):
+        """初始化速率限制器
+
+        Args:
+            max_attempts: 最大尝试次数（默认5次）
+            lockout_duration: 锁定时间（秒，默认15分钟）
+            window_size: 时间窗口大小（秒，默认5分钟）
+            on_rate_limit_triggered: 速率限制触发时的回调函数
+        """
+        self.max_attempts = max_attempts
+        self.lockout_duration = lockout_duration
+        self.window_size = window_size
+        self.on_rate_limit_triggered = on_rate_limit_triggered
+        self._attempts: dict[str, list] = {}  # key -> [timestamp1, timestamp2, ...]
+        self._lockouts: dict[str, float] = {}  # key -> lockout_end_time
+        self._lock = asyncio.Lock()
+
+    def _get_key(self, identifier: str, ip: str = "") -> str:
+        """生成唯一标识键"""
+        if ip:
+            return f"{identifier}:{ip}"
+        return identifier
+
+    async def check_rate_limit(self, identifier: str, ip: str = "") -> tuple[bool, str]:
+        """检查是否超出速率限制
+
+        Args:
+            identifier: 用户标识（如用户名）
+            ip: IP地址
+
+        Returns:
+            (是否允许, 错误信息)
+        """
+        async with self._lock:
+            key = self._get_key(identifier, ip)
+            current_time = time.time()
+
+            # 检查是否处于锁定状态
+            if key in self._lockouts:
+                lockout_end = self._lockouts[key]
+                if current_time < lockout_end:
+                    remaining = int(lockout_end - current_time)
+                    return False, f"登录尝试次数过多，请 {remaining // 60} 分钟后再试"
+                else:
+                    # 锁定已过期，清除记录
+                    del self._lockouts[key]
+                    if key in self._attempts:
+                        del self._attempts[key]
+
+            # 清理过期的尝试记录
+            if key in self._attempts:
+                self._attempts[key] = [
+                    t
+                    for t in self._attempts[key]
+                    if current_time - t < self.window_size
+                ]
+            else:
+                self._attempts[key] = []
+
+            # 检查尝试次数
+            if len(self._attempts[key]) >= self.max_attempts:
+                # 触发锁定
+                self._lockouts[key] = current_time + self.lockout_duration
+                
+                # 调用回调函数记录告警
+                if self.on_rate_limit_triggered:
+                    try:
+                        await self.on_rate_limit_triggered(identifier, ip, len(self._attempts[key]))
+                    except Exception as e:
+                        logger.error(f"速率限制告警回调失败: {e}")
+                
+                return (
+                    False,
+                    f"登录尝试次数过多，已锁定 {self.lockout_duration // 60} 分钟",
+                )
+
+            return True, ""
+
+    async def record_attempt(self, identifier: str, ip: str = ""):
+        """记录一次尝试"""
+        async with self._lock:
+            key = self._get_key(identifier, ip)
+            if key not in self._attempts:
+                self._attempts[key] = []
+            self._attempts[key].append(time.time())
+
+    async def reset_attempts(self, identifier: str, ip: str = ""):
+        """重置尝试记录（登录成功时调用）"""
+        async with self._lock:
+            key = self._get_key(identifier, ip)
+            if key in self._attempts:
+                del self._attempts[key]
+            if key in self._lockouts:
+                del self._lockouts[key]
+
+    def get_attempts_info(self, identifier: str, ip: str = "") -> dict:
+        """获取尝试信息（用于调试）"""
+        key = self._get_key(identifier, ip)
+        current_time = time.time()
+        attempts = self._attempts.get(key, [])
+        valid_attempts = [t for t in attempts if current_time - t < self.window_size]
+
+        return {
+            "attempts_count": len(valid_attempts),
+            "max_attempts": self.max_attempts,
+            "is_locked": key in self._lockouts
+            and current_time < self._lockouts.get(key, 0),
+            "lockout_remaining": max(0, int(self._lockouts.get(key, 0) - current_time))
+            if key in self._lockouts
+            else 0,
+        }
 
 
 class WebHandler:
@@ -417,18 +1577,54 @@ class WebHandler:
     - 验证码输入页面
     """
 
+    # Session 过期时间（24小时）
+    SESSION_EXPIRE_SECONDS = 86400
+
     def __init__(
         self,
         plugin,
         oidc_server: OIDCServer,
         config_manager: ConfigManager,
         client_manager: ClientManager,
+        audit_log_manager: AuditLogManager,
     ):
         self.plugin = plugin
         self.oidc_server = oidc_server
         self.config_manager = config_manager
         self.client_manager = client_manager
+        self.audit_log_manager = audit_log_manager
         self.sessions: dict[str, dict] = {}
+        
+        # 速率限制告警回调函数
+        async def on_rate_limit_triggered(identifier: str, ip: str, attempts: int):
+            self.audit_log_manager.log(
+                action="RATE_LIMIT_TRIGGERED",
+                details=f"触发速率限制: {attempts} 次失败尝试",
+                user=identifier,
+                ip=ip,
+            )
+            logger.warning(f"速率限制触发: 用户={identifier}, IP={ip}, 尝试次数={attempts}")
+        
+        # 初始化速率限制器
+        self.rate_limiter = RateLimiter(
+            max_attempts=5,
+            lockout_duration=900,  # 15分钟
+            window_size=300,  # 5分钟
+            on_rate_limit_triggered=on_rate_limit_triggered,
+        )
+
+    def _validate_session(self, token: str) -> bool:
+        """验证 session 是否有效（未过期）"""
+        if token not in self.sessions:
+            return False
+        session = self.sessions[token]
+        created_at = session.get("created_at", 0)
+        if time.time() - created_at > self.SESSION_EXPIRE_SECONDS:
+            # Session 已过期，删除
+            del self.sessions[token]
+            logger.info(f"Session 已过期并删除: {token[:10]}...")
+            return False
+        return True
 
     def _get_config(self, key: str, default=None):
         return self.plugin._get_config(key, default)
@@ -449,14 +1645,47 @@ class WebHandler:
     def _generate_session_token(self) -> str:
         return secrets.token_urlsafe(32)
 
+    def _get_allowed_origins(self) -> list[str]:
+        """获取允许的 CORS 域名列表"""
+        origins = []
+        for client_data in self.client_manager.get_all_clients().values():
+            redirect_url = client_data.get("redirect_url", "")
+            if redirect_url:
+                try:
+                    parsed = urlparse(redirect_url)
+                    origin = f"{parsed.scheme}://{parsed.netloc}"
+                    if origin not in origins:
+                        origins.append(origin)
+                except Exception:
+                    pass
+        return origins
+
+    def _set_cors_headers(self, response: web.Response, request: web.Request):
+        """设置 CORS 响应头，限制为已注册客户端的域名"""
+        origin = request.headers.get("Origin", "")
+        allowed_origins = self._get_allowed_origins()
+
+        # 对于 OIDC 端点，允许已注册的客户端域名
+        # 对于管理后台 API，允许当前请求的域名（如果来自管理后台）
+        if origin in allowed_origins:
+            response.headers["Access-Control-Allow-Origin"] = origin
+        else:
+            # 对于 .well-known 端点，允许所有域名（这是 OIDC 规范要求的）
+            path = request.path.strip("/")
+            if path.startswith(".well-known") or path == "authorize":
+                response.headers["Access-Control-Allow-Origin"] = "*"
+            elif origin:
+                # 记录未授权的 CORS 请求
+                logger.warning(f"CORS 请求被拒绝: origin={origin}, path={path}")
+
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Vary"] = "Origin"
+
     async def handle_root(self, request: web.Request) -> web.Response:
         if request.method == "OPTIONS":
             response = web.Response()
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, Authorization"
-            )
+            self._set_cors_headers(response, request)
             return response
 
         secure_path = self._get_config("secure_path", "chuyeoidc")
@@ -482,8 +1711,14 @@ class WebHandler:
             return await self.handle_api_check_password(request)
         elif path == f"{secure_path}/api/clients/add":
             return await self.handle_api_clients_add(request)
+        elif path == f"{secure_path}/api/clients/update":
+            return await self.handle_api_clients_update(request)
         elif path == f"{secure_path}/api/clients/delete":
             return await self.handle_api_clients_delete(request)
+        elif path == f"{secure_path}/api/logs":
+            return await self.handle_api_logs(request)
+        elif path == f"{secure_path}/api/logs/clear":
+            return await self.handle_api_logs_clear(request)
         elif path == "authorize":
             return await self.handle_authorize(request)
         elif path == "token":
@@ -492,6 +1727,8 @@ class WebHandler:
             return await self.handle_userinfo(request)
         elif path == ".well-known/openid-configuration":
             return await self.handle_discovery(request)
+        elif path == ".well-known/jwks.json":
+            return await self.handle_jwks(request)
         elif path == "verify":
             return await self.handle_verify_page(request)
         elif path == "api/verify":
@@ -534,10 +1771,32 @@ class WebHandler:
     async def handle_api_login(self, request: web.Request) -> web.Response:
         try:
             data = await request.json()
-            username = data.get("username", "")
+            username = data.get("username", "").strip()
             password = data.get("password", "")
+            ip = request.remote or ""
+
+            # 检查速率限制
+            allowed, error_msg = await self.rate_limiter.check_rate_limit(username, ip)
+            if not allowed:
+                self.audit_log_manager.log(
+                    action="LOGIN_RATE_LIMITED",
+                    details=error_msg,
+                    user=username,
+                    ip=ip,
+                )
+                return web.json_response(
+                    {"success": False, "message": error_msg},
+                    status=429,  # Too Many Requests
+                )
 
             if self._check_password_default():
+                await self.rate_limiter.record_attempt(username, ip)
+                self.audit_log_manager.log(
+                    action="LOGIN_FAILED",
+                    details="尝试使用默认密码登录",
+                    user=username,
+                    ip=ip,
+                )
                 return web.json_response(
                     {
                         "success": False,
@@ -548,12 +1807,37 @@ class WebHandler:
                 )
 
             if self._verify_login(username, password):
+                # 登录成功，重置尝试记录
+                await self.rate_limiter.reset_attempts(username, ip)
                 token = self._generate_session_token()
                 self.sessions[token] = {"username": username, "created_at": time.time()}
+                self.audit_log_manager.log(
+                    action="LOGIN",
+                    details="管理后台登录成功",
+                    user=username,
+                    ip=ip,
+                )
                 return web.json_response({"success": True, "token": token})
             else:
+                # 登录失败，记录尝试
+                await self.rate_limiter.record_attempt(username, ip)
+                # 获取剩余尝试次数
+                attempts_info = self.rate_limiter.get_attempts_info(username, ip)
+                remaining = max(
+                    0, attempts_info["max_attempts"] - attempts_info["attempts_count"]
+                )
+
+                self.audit_log_manager.log(
+                    action="LOGIN_FAILED",
+                    details=f"用户名或密码错误，剩余尝试次数: {remaining}",
+                    user=username,
+                    ip=ip,
+                )
+                error_message = "用户名或密码错误"
+                if remaining > 0:
+                    error_message += f"，还剩 {remaining} 次尝试机会"
                 return web.json_response(
-                    {"success": False, "message": "用户名或密码错误"}, status=401
+                    {"success": False, "message": error_message}, status=401
                 )
         except Exception as e:
             logger.error(f"登录处理错误: {e}")
@@ -574,9 +1858,9 @@ class WebHandler:
 
     async def handle_api_config(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token not in self.sessions:
+        if not self._validate_session(token):
             return web.json_response(
-                {"success": False, "message": "未授权"}, status=401
+                {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
         config_data = {
@@ -589,22 +1873,23 @@ class WebHandler:
             "verify_group_id": self._get_web_config("verify_group_id", ""),
             "code_expire_seconds": self._get_web_config("code_expire_seconds", 300),
             "code_length": self._get_web_config("code_length", 6),
+            "poll_interval": self._get_web_config("poll_interval", 1),
             "theme_color": self._get_web_config("theme_color", "#4f46e5"),
             "icon_url": self._get_web_config("icon_url", ""),
             "favicon_url": self._get_web_config("favicon_url", ""),
+            "jwt_secret": self._get_web_config("jwt_secret", ""),
         }
         return web.json_response({"success": True, "config": config_data})
 
     async def handle_api_config_save(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token not in self.sessions:
+        if not self._validate_session(token):
             return web.json_response(
-                {"success": False, "message": "未授权"}, status=401
+                {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
         try:
             data = await request.json()
-            logger.info(f"收到保存配置请求: {json.dumps(data, ensure_ascii=False)}")
 
             allowed_keys = [
                 "enable_group_verify",
@@ -612,9 +1897,11 @@ class WebHandler:
                 "verify_group_id",
                 "code_expire_seconds",
                 "code_length",
+                "poll_interval",
                 "theme_color",
                 "icon_url",
                 "favicon_url",
+                "jwt_secret",
             ]
 
             update_data = {}
@@ -622,12 +1909,15 @@ class WebHandler:
                 if key in data:
                     update_data[key] = data[key]
 
-            logger.info(
-                f"准备更新的配置: {json.dumps(update_data, ensure_ascii=False)}"
-            )
-
             if self.config_manager.update(update_data):
-                logger.info("配置保存成功")
+                # 记录配置更新审计日志
+                username = self.sessions.get(token, {}).get("username", "unknown")
+                self.audit_log_manager.log(
+                    action="CONFIG_UPDATE",
+                    details=f"更新配置: {list(update_data.keys())}",
+                    user=username,
+                    ip=request.remote or "",
+                )
                 return web.json_response({"success": True, "message": "配置保存成功"})
             else:
                 logger.error("配置保存失败")
@@ -642,9 +1932,9 @@ class WebHandler:
 
     async def handle_api_sessions(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token not in self.sessions:
+        if not self._validate_session(token):
             return web.json_response(
-                {"success": False, "message": "未授权"}, status=401
+                {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
         sessions = []
@@ -652,11 +1942,11 @@ class WebHandler:
             sessions.append(
                 {
                     "session_id": session_id,
-                    "code": session.code,
-                    "state": session.state,
-                    "verified": session.verified,
-                    "verified_user_id": session.verified_user_id,
-                    "created_at": session.created_at,
+                    "code": session.get("code", ""),
+                    "state": session.get("state", ""),
+                    "verified": session.get("verified", False),
+                    "verified_user_id": session.get("verified_user_id", ""),
+                    "created_at": session.get("created_at", 0),
                 }
             )
 
@@ -664,20 +1954,28 @@ class WebHandler:
 
     async def handle_api_clients(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token not in self.sessions:
+        if not self._validate_session(token):
             return web.json_response(
-                {"success": False, "message": "未授权"}, status=401
+                {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
         clients = []
         for client_id, client_data in self.client_manager.get_all_clients().items():
+            # 兼容旧数据格式
+            home_urls = client_data.get("home_urls", [])
+            redirect_urls = client_data.get("redirect_urls", [])
+            if not home_urls and client_data.get("home_url"):
+                home_urls = [client_data.get("home_url")]
+            if not redirect_urls and client_data.get("redirect_url"):
+                redirect_urls = [client_data.get("redirect_url")]
+
             clients.append(
                 {
                     "client_id": client_id,
                     "client_secret": client_data.get("client_secret", ""),
                     "name": client_data.get("name", client_id),
-                    "home_url": client_data.get("home_url", ""),
-                    "redirect_url": client_data.get("redirect_url", ""),
+                    "home_urls": home_urls,
+                    "redirect_urls": redirect_urls,
                     "created_at": client_data.get("created_at", 0),
                 }
             )
@@ -686,9 +1984,9 @@ class WebHandler:
 
     async def handle_api_clients_add(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token not in self.sessions:
+        if not self._validate_session(token):
             return web.json_response(
-                {"success": False, "message": "未授权"}, status=401
+                {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
         try:
@@ -696,8 +1994,8 @@ class WebHandler:
             client_id = data.get("client_id", "")
             client_secret = data.get("client_secret", "")
             name = data.get("name", "")
-            home_url = data.get("home_url", "")
-            redirect_url = data.get("redirect_url", "")
+            home_urls = data.get("home_urls", [])
+            redirect_urls = data.get("redirect_urls", [])
 
             if not client_id:
                 client_id = self.client_manager.generate_client_id()
@@ -706,9 +2004,23 @@ class WebHandler:
             if not name:
                 name = self.client_manager.generate_client_name()
 
+            # 兼容旧数据格式
+            if not home_urls and data.get("home_url"):
+                home_urls = [data.get("home_url")]
+            if not redirect_urls and data.get("redirect_url"):
+                redirect_urls = [data.get("redirect_url")]
+
             if self.client_manager.add_client(
-                client_id, client_secret, name, home_url, redirect_url
+                client_id, client_secret, name, home_urls, redirect_urls
             ):
+                # 记录客户端创建审计日志
+                username = self.sessions.get(token, {}).get("username", "unknown")
+                self.audit_log_manager.log(
+                    action="CLIENT_ADD",
+                    details=f"创建客户端: {name} ({client_id})",
+                    user=username,
+                    ip=request.remote or "",
+                )
                 return web.json_response(
                     {
                         "success": True,
@@ -717,8 +2029,8 @@ class WebHandler:
                             "client_id": client_id,
                             "client_secret": client_secret,
                             "name": name,
-                            "home_url": home_url,
-                            "redirect_url": redirect_url,
+                            "home_urls": home_urls,
+                            "redirect_urls": redirect_urls,
                         },
                     }
                 )
@@ -732,11 +2044,71 @@ class WebHandler:
                 {"success": False, "message": "服务器错误"}, status=500
             )
 
+    async def handle_api_clients_update(self, request: web.Request) -> web.Response:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not self._validate_session(token):
+            return web.json_response(
+                {"success": False, "message": "未授权或会话已过期"}, status=401
+            )
+
+        try:
+            data = await request.json()
+            client_id = data.get("client_id", "")
+            client_secret = data.get("client_secret", "")
+            name = data.get("name", "")
+            home_urls = data.get("home_urls", [])
+            redirect_urls = data.get("redirect_urls", [])
+
+            if not client_id:
+                return web.json_response(
+                    {"success": False, "message": "缺少 client_id"}, status=400
+                )
+
+            # 兼容旧数据格式
+            if not home_urls and data.get("home_url"):
+                home_urls = [data.get("home_url")]
+            if not redirect_urls and data.get("redirect_url"):
+                redirect_urls = [data.get("redirect_url")]
+
+            if self.client_manager.update_client(
+                client_id, client_secret, name, home_urls, redirect_urls
+            ):
+                # 记录客户端更新审计日志
+                username = self.sessions.get(token, {}).get("username", "unknown")
+                self.audit_log_manager.log(
+                    action="CLIENT_UPDATE",
+                    details=f"更新客户端: {name} ({client_id})",
+                    user=username,
+                    ip=request.remote or "",
+                )
+                return web.json_response(
+                    {
+                        "success": True,
+                        "message": "客户端更新成功",
+                        "client": {
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "name": name,
+                            "home_urls": home_urls,
+                            "redirect_urls": redirect_urls,
+                        },
+                    }
+                )
+            else:
+                return web.json_response(
+                    {"success": False, "message": "客户端不存在"}, status=404
+                )
+        except Exception as e:
+            logger.error(f"更新客户端错误: {e}")
+            return web.json_response(
+                {"success": False, "message": "服务器错误"}, status=500
+            )
+
     async def handle_api_clients_delete(self, request: web.Request) -> web.Response:
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token not in self.sessions:
+        if not self._validate_session(token):
             return web.json_response(
-                {"success": False, "message": "未授权"}, status=401
+                {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
         try:
@@ -749,6 +2121,14 @@ class WebHandler:
                 )
 
             if self.client_manager.delete_client(client_id):
+                # 记录客户端删除审计日志
+                username = self.sessions.get(token, {}).get("username", "unknown")
+                self.audit_log_manager.log(
+                    action="CLIENT_DELETE",
+                    details=f"删除客户端: {client_id}",
+                    user=username,
+                    ip=request.remote or "",
+                )
                 return web.json_response({"success": True, "message": "客户端删除成功"})
             else:
                 return web.json_response(
@@ -756,6 +2136,60 @@ class WebHandler:
                 )
         except Exception as e:
             logger.error(f"删除客户端错误: {e}")
+            return web.json_response(
+                {"success": False, "message": "服务器错误"}, status=500
+            )
+
+    async def handle_api_logs(self, request: web.Request) -> web.Response:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not self._validate_session(token):
+            return web.json_response(
+                {"success": False, "message": "未授权或会话已过期"}, status=401
+            )
+
+        try:
+            limit = int(request.query.get("limit", 100))
+            offset = int(request.query.get("offset", 0))
+            action_filter = request.query.get("action", None)
+
+            logs = self.audit_log_manager.get_logs(limit, offset, action_filter)
+            total = self.audit_log_manager.get_logs_count(action_filter)
+
+            return web.json_response(
+                {
+                    "success": True,
+                    "logs": logs,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                }
+            )
+        except Exception as e:
+            logger.error(f"获取审计日志错误: {e}")
+            return web.json_response(
+                {"success": False, "message": "服务器错误"}, status=500
+            )
+
+    async def handle_api_logs_clear(self, request: web.Request) -> web.Response:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        if not self._validate_session(token):
+            return web.json_response(
+                {"success": False, "message": "未授权或会话已过期"}, status=401
+            )
+
+        try:
+            self.audit_log_manager.clear_logs()
+            # 记录清空日志操作
+            username = self.sessions.get(token, {}).get("username", "unknown")
+            self.audit_log_manager.log(
+                action="LOGS_CLEAR",
+                details="清空审计日志",
+                user=username,
+                ip=request.remote or "",
+            )
+            return web.json_response({"success": True, "message": "日志已清空"})
+        except Exception as e:
+            logger.error(f"清空审计日志错误: {e}")
             return web.json_response(
                 {"success": False, "message": "服务器错误"}, status=500
             )
@@ -792,12 +2226,31 @@ class WebHandler:
                 status=400,
             )
 
-        session_id, verify_code = await self.oidc_server.create_auth_session(
+        # 校验 redirect_uri 是否与客户端注册的 redirect_url 匹配
+        # 对收到的 redirect_uri 进行解码，以支持 URL 编码的地址
+        from urllib.parse import unquote
+
+        decoded_redirect_uri = unquote(redirect_uri)
+
+        # 使用新的 verify_redirect_uri 方法验证
+        if not self.client_manager.verify_redirect_uri(client_id, decoded_redirect_uri):
+            logger.warning(
+                f"redirect_uri 不匹配: client_id={client_id}, uri={decoded_redirect_uri}"
+            )
+            return web.json_response(
+                {
+                    "error": "invalid_request",
+                    "error_description": "redirect_uri does not match registered redirect_url",
+                },
+                status=400,
+            )
+
+        session_id, verify_code, auth_code = await self.oidc_server.create_auth_session(
             redirect_uri, state, client_id
         )
 
         html = self._render_verify_page(
-            verify_code, session_id, redirect_uri, state, scope, client
+            verify_code, auth_code, session_id, redirect_uri, state, scope, client
         )
         return web.Response(text=html, content_type="text/html", charset="utf-8")
 
@@ -815,9 +2268,7 @@ class WebHandler:
         client_id = data.get("client_id", "")
         client_secret = data.get("client_secret", "")
 
-        logger.info(
-            f"Token参数: grant_type={grant_type}, code={code}, client_id={client_id}"
-        )
+        logger.info(f"Token请求: grant_type={grant_type}, client_id={client_id}")
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Basic "):
@@ -834,40 +2285,95 @@ class WebHandler:
             except Exception:
                 pass
 
-        if grant_type != "authorization_code":
+        if grant_type == "authorization_code":
+            # 使用授权码换取 token
+            if not client_id:
+                return web.json_response(
+                    {
+                        "error": "invalid_client",
+                        "error_description": "missing client_id",
+                    },
+                    status=400,
+                )
+
+            if not self.client_manager.verify_client(client_id, client_secret):
+                return web.json_response(
+                    {
+                        "error": "invalid_client",
+                        "error_description": "client authentication failed",
+                    },
+                    status=401,
+                )
+
+            token_data = await self.oidc_server.exchange_code(code, client_id)
+
+            if not token_data:
+                return web.json_response({"error": "invalid_grant"}, status=400)
+
+            # 记录授权审计日志
+            self.audit_log_manager.log(
+                action="TOKEN_EXCHANGE",
+                details=f"授权码换取Token: client_id={client_id}",
+                user="",
+                ip=request.remote or "",
+            )
+
+            response = web.json_response(token_data)
+            self._set_cors_headers(response, request)
+            return response
+
+        elif grant_type == "refresh_token":
+            # 使用 refresh_token 换取新的 token
+            refresh_token = data.get("refresh_token", "")
+
+            if not client_id:
+                return web.json_response(
+                    {
+                        "error": "invalid_client",
+                        "error_description": "missing client_id",
+                    },
+                    status=400,
+                )
+
+            if not self.client_manager.verify_client(client_id, client_secret):
+                return web.json_response(
+                    {
+                        "error": "invalid_client",
+                        "error_description": "client authentication failed",
+                    },
+                    status=401,
+                )
+
+            token_data = await self.oidc_server.exchange_refresh_token(
+                refresh_token, client_id
+            )
+
+            if not token_data:
+                return web.json_response(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "invalid refresh_token",
+                    },
+                    status=400,
+                )
+
+            # 记录刷新 token 审计日志
+            self.audit_log_manager.log(
+                action="TOKEN_REFRESH",
+                details=f"刷新Token: client_id={client_id}",
+                user="",
+                ip=request.remote or "",
+            )
+
+            response = web.json_response(token_data)
+            self._set_cors_headers(response, request)
+            return response
+
+        else:
             return web.json_response({"error": "unsupported_grant_type"}, status=400)
-
-        if not client_id:
-            return web.json_response(
-                {"error": "invalid_client", "error_description": "missing client_id"},
-                status=400,
-            )
-
-        if not self.client_manager.verify_client(client_id, client_secret):
-            return web.json_response(
-                {
-                    "error": "invalid_client",
-                    "error_description": "client authentication failed",
-                },
-                status=401,
-            )
-
-        token_data = await self.oidc_server.exchange_code(code, client_id)
-
-        if not token_data:
-            return web.json_response({"error": "invalid_grant"}, status=400)
-
-        response = web.json_response(token_data)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        return response
 
     async def handle_userinfo(self, request: web.Request) -> web.Response:
         auth_header = request.headers.get("Authorization", "")
-        logger.info(
-            f"Userinfo请求: auth_header={auth_header[:30] if auth_header else 'None'}..."
-        )
 
         if not auth_header.startswith("Bearer "):
             logger.warning("Userinfo: 缺少Bearer token")
@@ -875,8 +2381,6 @@ class WebHandler:
 
         token = auth_header[7:]
         user_data = await self.oidc_server.get_user_info(token)
-
-        logger.info(f"Userinfo数据: {user_data}")
 
         if not user_data:
             logger.warning("Userinfo: 无效的token")
@@ -901,12 +2405,8 @@ class WebHandler:
             "updated_at": int(time.time()),
         }
 
-        logger.info(f"返回userinfo: {userinfo_response}")
-
         response = web.json_response(userinfo_response)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        self._set_cors_headers(response, request)
         return response
 
     async def handle_discovery(self, request: web.Request) -> web.Response:
@@ -914,28 +2414,48 @@ class WebHandler:
         base_url = f"http://{host}"
 
         discovery = {
-            "issuer": base_url,
+            "issuer": "https://chuyeoidc.astrbot",
             "authorization_endpoint": f"{base_url}/authorize",
             "token_endpoint": f"{base_url}/token",
             "userinfo_endpoint": f"{base_url}/userinfo",
             "jwks_uri": f"{base_url}/.well-known/jwks.json",
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["none"],
-            "scopes_supported": ["openid", "profile"],
-            "grant_types_supported": ["authorization_code"],
+            "id_token_signing_alg_values_supported": ["HS256"],
+            "scopes_supported": ["openid", "profile", "email"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": [
                 "client_secret_post",
                 "client_secret_basic",
             ],
-            "code_challenge_methods_supported": [],
-            "claims_supported": ["sub", "name", "id"],
+            "code_challenge_methods_supported": ["S256", "plain"],
+            "claims_supported": [
+                "sub",
+                "name",
+                "nickname",
+                "email",
+                "iss",
+                "aud",
+                "exp",
+                "iat",
+            ],
         }
 
         response = web.json_response(discovery)
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        self._set_cors_headers(response, request)
+        return response
+
+    async def handle_jwks(self, request: web.Request) -> web.Response:
+        """JWKS 端点 - 提供 JWT 签名公钥
+
+        返回 RSA 公钥的 JWKS 格式，供客户端验证 JWT 签名。
+        使用 RS256 非对称加密算法，私钥签名，公钥验证。
+        支持多密钥（用于密钥轮换）。
+        """
+        jwks = {"keys": self.oidc_server._get_jwks_keys()}
+
+        response = web.json_response(jwks)
+        self._set_cors_headers(response, request)
         return response
 
     async def handle_verify_page(self, request: web.Request) -> web.Response:
@@ -961,7 +2481,8 @@ class WebHandler:
             if success:
                 session = await self.oidc_server.get_session(result)
                 if session:
-                    redirect_url = f"{session.redirect_uri}?code={session.code}&state={session.state}"
+                    # 使用 auth_code（高熵授权码）而不是 code（验证码）
+                    redirect_url = f"{session.redirect_uri}?code={session.auth_code}&state={session.state}"
                     return web.json_response(
                         {
                             "success": True,
@@ -980,16 +2501,12 @@ class WebHandler:
     async def handle_api_session_status(self, request: web.Request) -> web.Response:
         try:
             session_id = request.query.get("session_id", "")
-            logger.info(f"检查会话状态: session_id={session_id}")
             if not session_id:
                 return web.json_response(
                     {"success": False, "message": "缺少session_id"}, status=400
                 )
 
             session = await self.oidc_server.get_session(session_id)
-            logger.info(
-                f"获取会话结果: session存在={session is not None}, verified={session.verified if session else None}"
-            )
             if not session:
                 return web.json_response(
                     {"success": False, "message": "会话不存在"}, status=404
@@ -1022,6 +2539,22 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" style="width: 64px; height: 64px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>"""
         )
 
+        try:
+            # 尝试使用外部模板
+            return template_manager.render(
+                "login",
+                theme_color=theme_color,
+                icon_html=icon_html,
+                favicon_url=favicon_url,
+            )
+        except (FileNotFoundError, KeyError) as e:
+            logger.warning(f"外部模板加载失败，使用内置模板: {e}")
+            return self._render_login_page_builtin(theme_color, icon_html, favicon_url)
+
+    def _render_login_page_builtin(
+        self, theme_color: str, icon_html: str, favicon_url: str
+    ) -> str:
+        """内置登录页面模板（当外部模板不可用时使用）"""
         return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1260,6 +2793,12 @@ class WebHandler:
                 </svg>
                 客户端管理
             </button>
+            <button class="tab px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2" data-tab="logs">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                审计日志
+            </button>
         </div>
 
         <div id="tab-info" class="tab-content space-y-8">
@@ -1360,6 +2899,11 @@ class WebHandler:
                                 <label class="block text-sm font-bold text-slate-700 mb-2">有效期 (秒)</label>
                                 <input type="number" id="codeExpire" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="60" max="1800">
                             </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">轮询间隔 (秒)</label>
+                                <input type="number" id="pollInterval" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="1" max="30">
+                                <p class="text-xs text-slate-500 mt-2">验证页面检查状态的时间间隔，范围 1-30 秒</p>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1455,17 +2999,40 @@ class WebHandler:
                             <label class="block text-sm font-bold text-slate-700 mb-2">Client Secret (留空自动生成)</label>
                             <input type="text" id="newClientSecret" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="留空自动生成">
                         </div>
-                        <div>
+                        <div class="md:col-span-2">
                             <label class="block text-sm font-bold text-slate-700 mb-2">主页链接</label>
-                            <input type="text" id="newClientHomeUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com">
+                            <div id="homeUrlsContainer" class="space-y-2">
+                                <div class="flex items-center gap-2">
+                                    <input type="text" class="home-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com">
+                                </div>
+                            </div>
+                            <button onclick="addHomeUrlInput()" class="mt-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                                </svg>
+                                添加主页链接
+                            </button>
                         </div>
-                        <div>
+                        <div class="md:col-span-2">
                             <label class="block text-sm font-bold text-slate-700 mb-2">重定向 URL</label>
-                            <input type="text" id="newClientRedirectUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback">
+                            <div id="redirectUrlsContainer" class="space-y-2">
+                                <div class="flex items-center gap-2">
+                                    <input type="text" class="redirect-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback">
+                                </div>
+                            </div>
+                            <button onclick="addRedirectUrlInput()" class="mt-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                                </svg>
+                                添加重定向 URL
+                            </button>
                         </div>
                     </div>
-                    <div class="mt-6 flex justify-end">
-                        <button onclick="addClient()" class="px-6 py-3 bg-primary hover:opacity-90 text-white rounded-2xl font-bold shadow-lg shadow-primary/30 transition-all active:scale-[0.98] flex items-center gap-2">
+                    <div class="mt-6 flex justify-end gap-3">
+                        <button id="cancelEditBtn" onclick="resetClientForm()" class="hidden px-6 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-bold transition-all active:scale-[0.98]">
+                            取消编辑
+                        </button>
+                        <button id="addClientBtn" onclick="addClient()" class="px-6 py-3 bg-primary hover:opacity-90 text-white rounded-2xl font-bold shadow-lg shadow-primary/30 transition-all active:scale-[0.98] flex items-center gap-2">
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
                             </svg>
@@ -1499,6 +3066,69 @@ class WebHandler:
                                 <tr><td colspan="7" class="px-6 py-12 text-center text-slate-400 font-medium">暂无客户端，请添加新客户端</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-logs" class="tab-content hidden">
+            <div class="space-y-8">
+                <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
+                    <div class="flex items-center justify-between mb-6">
+                        <h2 class="text-lg font-bold flex items-center gap-2">
+                            <span class="w-2 h-6 bg-primary rounded-full"></span>
+                            审计日志
+                        </h2>
+                        <div class="flex items-center gap-3">
+                            <select id="logFilter" class="px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none">
+                                <option value="">全部类型</option>
+                                <option value="LOGIN">登录</option>
+                                <option value="LOGOUT">登出</option>
+                                <option value="CLIENT_ADD">添加客户端</option>
+                                <option value="CLIENT_UPDATE">更新客户端</option>
+                                <option value="CLIENT_DELETE">删除客户端</option>
+                                <option value="CONFIG_UPDATE">配置更新</option>
+                                <option value="AUTHORIZE">授权</option>
+                                <option value="TOKEN_EXCHANGE">令牌交换</option>
+                                <option value="CLEAR_LOGS">清空日志</option>
+                            </select>
+                            <button onclick="clearLogs()" class="px-4 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                                清空日志
+                            </button>
+                        </div>
+                    </div>
+                    <div class="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
+                        <div class="overflow-x-auto custom-scrollbar max-h-[500px]">
+                            <table class="w-full text-left border-collapse">
+                                <thead class="sticky top-0 bg-white z-10">
+                                    <tr class="bg-slate-50/50 border-b border-slate-100">
+                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">时间</th>
+                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">操作类型</th>
+                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">详情</th>
+                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">用户</th>
+                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">IP地址</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="logTable" class="divide-y divide-slate-100">
+                                    <tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">加载中...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="flex items-center justify-between mt-6">
+                        <span class="text-sm text-slate-500" id="logCount">共 0 条日志</span>
+                        <div class="flex items-center gap-2">
+                            <button onclick="changeLogPage(-1)" id="prevLogPage" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                                上一页
+                            </button>
+                            <span class="text-sm text-slate-600 font-medium" id="logPageInfo">第 1 页</span>
+                            <button onclick="changeLogPage(1)" id="nextLogPage" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                                下一页
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1560,6 +3190,7 @@ class WebHandler:
                 
                 document.getElementById('codeLength').value = config.code_length || 6;
                 document.getElementById('codeExpire').value = config.code_expire_seconds || 300;
+                document.getElementById('pollInterval').value = config.poll_interval || 1;
                 document.getElementById('enableGroupVerify').checked = config.enable_group_verify !== false;
                 document.getElementById('enablePrivateVerify').checked = config.enable_private_verify !== false;
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
@@ -1590,6 +3221,7 @@ class WebHandler:
             const config = {{
                 code_length: parseInt(document.getElementById('codeLength').value),
                 code_expire_seconds: parseInt(document.getElementById('codeExpire').value),
+                poll_interval: parseInt(document.getElementById('pollInterval').value),
                 enable_group_verify: document.getElementById('enableGroupVerify').checked,
                 enable_private_verify: document.getElementById('enablePrivateVerify').checked,
                 verify_group_id: document.getElementById('verifyGroupId').value,
@@ -1711,20 +3343,39 @@ class WebHandler:
                             </div>
                         </td>
                         <td class="px-6 py-4 text-sm text-slate-600">
-                            <div class="flex items-center gap-2">
-                                <span title="${{c.home_url || ''}}">${{truncateUrl(c.home_url)}}</span>
-                                ${{c.home_url ? `<button onclick="copyText('${{c.home_url}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制"><svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg></button>` : ''}}
-                            </div>
+                            ${{c.home_urls && c.home_urls.length > 0 ? `
+                                <div class="flex items-center gap-2">
+                                    ${{c.home_urls.length === 1 ? `
+                                        <span title="${{c.home_urls[0]}}">${{truncateUrl(c.home_urls[0])}}</span>
+                                        <button onclick="copyText('${{c.home_urls[0]}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                            </svg>
+                                        </button>
+                                    ` : `<span class="px-2 py-1 bg-slate-100 rounded-lg text-xs font-bold">${{c.home_urls.length}} 个链接</span>`}}
+                                </div>
+                            ` : '<span class="text-slate-300">-</span>'}}
                         </td>
                         <td class="px-6 py-4 text-sm text-slate-600">
-                            <div class="flex items-center gap-2">
-                                <span title="${{c.redirect_url || ''}}">${{truncateUrl(c.redirect_url)}}</span>
-                                ${{c.redirect_url ? `<button onclick="copyText('${{c.redirect_url}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制"><svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg></button>` : ''}}
-                            </div>
+                            ${{c.redirect_urls && c.redirect_urls.length > 0 ? `
+                                <div class="flex items-center gap-2">
+                                    ${{c.redirect_urls.length === 1 ? `
+                                        <span title="${{c.redirect_urls[0]}}">${{truncateUrl(c.redirect_urls[0])}}</span>
+                                        <button onclick="copyText('${{c.redirect_urls[0]}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                            </svg>
+                                        </button>
+                                    ` : `<span class="px-2 py-1 bg-slate-100 rounded-lg text-xs font-bold">${{c.redirect_urls.length}} 个链接</span>`}}
+                                </div>
+                            ` : '<span class="text-slate-300">-</span>'}}
                         </td>
                         <td class="px-6 py-4 text-sm text-slate-400 font-medium">${{new Date(c.created_at * 1000).toLocaleString()}}</td>
                         <td class="px-6 py-4">
-                            <button onclick="deleteClient('${{c.client_id}}')" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
+                            <div class="flex items-center gap-2">
+                                <button onclick='editClient("${{c.client_id}}", "${{c.name}}", "${{c.client_secret}}", ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
+                                <button onclick="deleteClient('${{c.client_id}}')" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
+                            </div>
                         </td>
                     </tr>
                 `).join('');
@@ -1740,18 +3391,125 @@ class WebHandler:
                 console.error('复制失败:', err);
             }});
         }}
-        
+
+        // 编辑客户端相关函数
+        let editingClientId = null;
+
+        function addHomeUrlInput(value = '') {{
+            const container = document.getElementById('homeUrlsContainer');
+            const div = document.createElement('div');
+            div.className = 'flex items-center gap-2';
+            div.innerHTML = `
+                <input type="text" class="home-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com" value="${{value}}">
+                <button onclick="this.parentElement.remove()" class="px-3 py-3 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl transition-all" title="删除">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            `;
+            container.appendChild(div);
+        }}
+
+        function addRedirectUrlInput(value = '') {{
+            const container = document.getElementById('redirectUrlsContainer');
+            const div = document.createElement('div');
+            div.className = 'flex items-center gap-2';
+            div.innerHTML = `
+                <input type="text" class="redirect-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback" value="${{value}}">
+                <button onclick="this.parentElement.remove()" class="px-3 py-3 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl transition-all" title="删除">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            `;
+            container.appendChild(div);
+        }}
+
+        function getHomeUrls() {{
+            const inputs = document.querySelectorAll('#homeUrlsContainer .home-url-input');
+            return Array.from(inputs).map(input => input.value.trim()).filter(url => url);
+        }}
+
+        function getRedirectUrls() {{
+            const inputs = document.querySelectorAll('#redirectUrlsContainer .redirect-url-input');
+            return Array.from(inputs).map(input => input.value.trim()).filter(url => url);
+        }}
+
+        function resetClientForm() {{
+            editingClientId = null;
+            document.getElementById('newClientName').value = '';
+            document.getElementById('newClientId').value = '';
+            document.getElementById('newClientSecret').value = '';
+            document.getElementById('homeUrlsContainer').innerHTML = `
+                <div class="flex items-center gap-2">
+                    <input type="text" class="home-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com">
+                </div>
+            `;
+            document.getElementById('redirectUrlsContainer').innerHTML = `
+                <div class="flex items-center gap-2">
+                    <input type="text" class="redirect-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback">
+                </div>
+            `;
+            document.getElementById('addClientBtn').textContent = '添加客户端';
+            document.getElementById('cancelEditBtn').classList.add('hidden');
+        }}
+
+        function editClient(clientId, name, clientSecret, homeUrls, redirectUrls) {{
+            editingClientId = clientId;
+            document.getElementById('newClientName').value = name || '';
+            document.getElementById('newClientId').value = clientId || '';
+            document.getElementById('newClientSecret').value = clientSecret || '';
+
+            // 设置主页链接
+            const homeUrlsContainer = document.getElementById('homeUrlsContainer');
+            homeUrlsContainer.innerHTML = '';
+            if (homeUrls && homeUrls.length > 0) {{
+                homeUrls.forEach(url => addHomeUrlInput(url));
+            }} else {{
+                addHomeUrlInput();
+            }}
+
+            // 设置重定向URL
+            const redirectUrlsContainer = document.getElementById('redirectUrlsContainer');
+            redirectUrlsContainer.innerHTML = '';
+            if (redirectUrls && redirectUrls.length > 0) {{
+                redirectUrls.forEach(url => addRedirectUrlInput(url));
+            }} else {{
+                addRedirectUrlInput();
+            }}
+
+            document.getElementById('addClientBtn').textContent = '更新客户端';
+            document.getElementById('cancelEditBtn').classList.remove('hidden');
+
+            // 滚动到表单
+            document.querySelector('#tab-clients .bg-white').scrollIntoView({{ behavior: 'smooth' }});
+        }}
+
         async function addClient() {{
             const name = document.getElementById('newClientName').value;
             const client_id = document.getElementById('newClientId').value;
             const client_secret = document.getElementById('newClientSecret').value;
-            const home_url = document.getElementById('newClientHomeUrl').value;
-            const redirect_url = document.getElementById('newClientRedirectUrl').value;
-            
+            const home_urls = getHomeUrls();
+            const redirect_urls = getRedirectUrls();
+
+            if (!name) {{
+                showToast('请输入客户端名称', 'error');
+                return;
+            }}
+
+            if (redirect_urls.length === 0) {{
+                showToast('请至少添加一个重定向 URL', 'error');
+                return;
+            }}
+
+            const isEditing = editingClientId !== null;
+            const endpoint = isEditing ? 'api/clients/update' : 'api/clients/add';
+            const successMessage = isEditing ? '客户端更新成功！' : '客户端创建成功！';
+
             try {{
-                const response = await fetch(basePath + 'api/clients/add', {{
+                const response = await fetch(basePath + endpoint, {{
                     method: 'POST',
-                    headers: {{ 
+                    headers: {{
                         'Content-Type': 'application/json',
                         'Authorization': 'Bearer ' + token
                     }},
@@ -1759,25 +3517,21 @@ class WebHandler:
                         name: name,
                         client_id: client_id,
                         client_secret: client_secret,
-                        home_url: home_url,
-                        redirect_url: redirect_url
+                        home_urls: home_urls,
+                        redirect_urls: redirect_urls
                     }})
                 }});
                 const data = await response.json();
-                
+
                 if (data.success) {{
-                    showToast(`客户端创建成功！\\nClient ID: ${{data.client.client_id}}\\nClient Secret: ${{data.client.client_secret}}`, 'success');
-                    document.getElementById('newClientName').value = '';
-                    document.getElementById('newClientId').value = '';
-                    document.getElementById('newClientSecret').value = '';
-                    document.getElementById('newClientHomeUrl').value = '';
-                    document.getElementById('newClientRedirectUrl').value = '';
+                    showToast(successMessage, 'success');
+                    resetClientForm();
                     loadClients();
                 }} else {{
-                    showToast(data.message || '添加失败', 'error');
+                    showToast(data.message || (isEditing ? '更新失败' : '添加失败'), 'error');
                 }}
             }} catch (err) {{
-                console.error('添加客户端失败:', err);
+                console.error(isEditing ? '更新客户端失败:' : '添加客户端失败:', err);
                 showToast('网络错误，请重试', 'error');
             }}
         }}
@@ -1828,9 +3582,101 @@ class WebHandler:
             }}
         }});
         
+        // 审计日志相关变量
+        let currentLogPage = 0;
+        const logsPerPage = 20;
+        let currentLogFilter = '';
+
+        async function loadLogs() {{
+            try {{
+                const response = await fetch(basePath + `api/logs?limit=${{logsPerPage}}&offset=${{currentLogPage * logsPerPage}}&action=${{currentLogFilter}}`, {{
+                    headers: {{ 'Authorization': 'Bearer ' + token }}
+                }});
+                const data = await response.json();
+                if (!data.success) return;
+
+                document.getElementById('logCount').textContent = `共 ${{data.total}} 条日志`;
+                const tbody = document.getElementById('logTable');
+                if (data.logs.length === 0) {{
+                    tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">暂无日志</td></tr>';
+                }} else {{
+                    const actionLabels = {{
+                        'LOGIN': {{ text: '登录', class: 'bg-blue-100 text-blue-600' }},
+                        'LOGOUT': {{ text: '登出', class: 'bg-gray-100 text-gray-600' }},
+                        'CLIENT_ADD': {{ text: '添加客户端', class: 'bg-green-100 text-green-600' }},
+                        'CLIENT_UPDATE': {{ text: '更新客户端', class: 'bg-yellow-100 text-yellow-600' }},
+                        'CLIENT_DELETE': {{ text: '删除客户端', class: 'bg-red-100 text-red-600' }},
+                        'CONFIG_UPDATE': {{ text: '配置更新', class: 'bg-purple-100 text-purple-600' }},
+                        'AUTHORIZE': {{ text: '授权', class: 'bg-indigo-100 text-indigo-600' }},
+                        'TOKEN_EXCHANGE': {{ text: '令牌交换', class: 'bg-teal-100 text-teal-600' }},
+                        'CLEAR_LOGS': {{ text: '清空日志', class: 'bg-orange-100 text-orange-600' }}
+                    }};
+
+                    tbody.innerHTML = data.logs.map(log => {{
+                        const action = actionLabels[log.action] || {{ text: log.action, class: 'bg-slate-100 text-slate-600' }};
+                        return `
+                            <tr class="hover:bg-slate-50/50 transition-colors">
+                                <td class="px-6 py-4 text-sm text-slate-600">${{new Date(log.timestamp * 1000).toLocaleString()}}</td>
+                                <td class="px-6 py-4">
+                                    <span class="px-3 py-1 rounded-full text-xs font-bold ${{action.class}}">${{action.text}}</span>
+                                </td>
+                                <td class="px-6 py-4 text-sm text-slate-600">${{log.details || '-'}}</td>
+                                <td class="px-6 py-4 text-sm text-slate-600">${{log.user || '-'}}</td>
+                                <td class="px-6 py-4 text-sm text-slate-600 font-mono">${{log.ip || '-'}}</td>
+                            </tr>
+                        `;
+                    }}).join('');
+                }}
+
+                // 更新分页按钮状态
+                document.getElementById('prevLogPage').disabled = currentLogPage === 0;
+                document.getElementById('nextLogPage').disabled = (currentLogPage + 1) * logsPerPage >= data.total;
+                document.getElementById('logPageInfo').textContent = `第 ${{currentLogPage + 1}} 页`;
+            }} catch (err) {{
+                console.error('加载日志失败:', err);
+            }}
+        }}
+
+        function changeLogPage(delta) {{
+            currentLogPage += delta;
+            if (currentLogPage < 0) currentLogPage = 0;
+            loadLogs();
+        }}
+
+        async function clearLogs() {{
+            if (!confirm('确定要清空所有审计日志吗？此操作不可恢复。')) return;
+
+            try {{
+                const response = await fetch(basePath + 'api/logs/clear', {{
+                    method: 'POST',
+                    headers: {{ 'Authorization': 'Bearer ' + token }}
+                }});
+                const data = await response.json();
+
+                if (data.success) {{
+                    showToast('日志已清空', 'success');
+                    currentLogPage = 0;
+                    loadLogs();
+                }} else {{
+                    showToast(data.message || '清空失败', 'error');
+                }}
+            }} catch (err) {{
+                console.error('清空日志失败:', err);
+                showToast('网络错误，请重试', 'error');
+            }}
+        }}
+
+        // 日志过滤器事件监听
+        document.getElementById('logFilter').addEventListener('change', function(e) {{
+            currentLogFilter = e.target.value;
+            currentLogPage = 0;
+            loadLogs();
+        }});
+
         loadConfig();
         loadSessions();
         loadClients();
+        loadLogs();
         setInterval(loadSessions, 5000);
     </script>
 </body>
@@ -1839,6 +3685,7 @@ class WebHandler:
     def _render_verify_page(
         self,
         code: str,
+        auth_code: str,
         session_id: str,
         redirect_uri: str,
         state: str,
@@ -1857,6 +3704,8 @@ class WebHandler:
             "favicon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
         )
+        poll_interval = self._get_web_config("poll_interval", 1)
+        poll_interval_ms = max(1000, min(30000, poll_interval * 1000))
 
         client_name = client.get("name", "未知应用") if client else "未知应用"
 
@@ -1930,344 +3779,88 @@ class WebHandler:
                 </div>
             </div>"""
 
-        return f'''<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OIDC 验证 - 身份验证</title>
-    <link rel="icon" type="image/png" href="{favicon_url}">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script>
-        tailwind.config = {{
-            theme: {{
-                extend: {{
-                    colors: {{
-                        primary: '{theme_color}',
-                    }}
-                }}
-            }}
-        }}
-    </script>
-    <style>
-        body {{ font-family: 'Inter', -apple-system, sans-serif; }}
-        .glass {{ background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }}
-        .code-char {{ display: inline-block; width: 3rem; height: 4rem; line-height: 4rem; background: white; border-radius: 1rem; margin: 0 0.25rem; font-size: 2rem; font-weight: 800; color: {theme_color}; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }}
-        .bg-primary {{ background-color: {theme_color}; }}
-        .text-primary {{ color: {theme_color}; }}
-        .border-primary {{ border-color: {theme_color}; }}
-        .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color}33; }}
-        /* 桌面端左右布局 - 合并为一个框 */
-        @media (min-width: 1024px) {{
-            .desktop-container {{
-                max-width: 800px;
-                width: 100%;
-            }}
-            .desktop-inner {{
-                display: grid;
-                grid-template-columns: 50% 50%;
-                gap: 0;
-            }}
-            .desktop-left, .desktop-right {{
-                width: 100%;
-                box-sizing: border-box;
-            }}
-            .mobile-only {{
-                display: none !important;
-            }}
-        }}
-        /* 移动端单列布局 */
-        @media (max-width: 1023px) {{
-            .desktop-container {{
-                max-width: 28rem;
-                width: 100%;
-            }}
-            .desktop-left {{
-                display: none;
-            }}
-        }}
-    </style>
-</head>
-<body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 bg-[radial-gradient(circle_at_bottom_right,_var(--tw-gradient-stops))] from-indigo-100 via-slate-50 to-teal-50">
-    <div class="desktop-container mx-auto">
-        <div class="glass rounded-[2.5rem] shadow-2xl shadow-primary/30 p-6 sm:p-8 md:p-10 border border-white">
-            <!-- 桌面端左右布局 -->
-            <div class="desktop-inner">
-                <!-- 桌面端左侧：应用信息和权限 -->
-                <div class="desktop-left text-left p-6" style="padding-right: 2rem;">
-                    <div class="flex items-center gap-4 mb-8">
-                        <div style="width: 64px; height: 64px; flex-shrink: 0;">
-                            {icon_html}
-                        </div>
-                        <div>
-                            <h1 class="text-2xl font-bold text-slate-800 tracking-tight">授权登录</h1>
-                            <p class="text-slate-500 mt-1 font-medium text-sm"><strong class="text-primary">{client_name}</strong> 请求访问你的账号</p>
-                        </div>
-                    </div>
-                    
-                    <div>
-                        <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">请求的权限</p>
-                        <div class="space-y-2">
-                            {scope_items}
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- 右侧：验证码和操作 -->
-                <div class="desktop-right text-center" style="padding-left: 2rem;">
-                    <!-- 移动端显示的应用信息 -->
-                    <div class="mobile-only mb-6">
-                        <div class="mx-auto mb-6" style="width: 64px; height: 64px;">
-                            {icon_html}
-                        </div>
-                        <h1 class="text-2xl font-bold text-slate-800 tracking-tight">授权登录</h1>
-                        <p class="text-slate-500 mt-1 font-medium text-sm"><strong class="text-primary">{client_name}</strong> 请求访问你的账号</p>
-                    </div>
+        # 从模板文件加载
+        try:
+            from .templates import template_manager
 
-                    <div class="bg-primary rounded-3xl p-6 mb-6 shadow-xl shadow-primary/30 relative overflow-hidden">
-                        <div class="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
-                            <svg width="100%" height="100%" viewBox="0 0 100 100" preserveAspectRatio="none">
-                                <path d="M0 100 C 20 0 50 0 100 100 Z" fill="white"></path>
-                            </svg>
-                        </div>
-                        <p class="text-white/70 text-xs font-bold uppercase tracking-[0.2em] mb-3 relative z-10">验证码</p>
-                        <div class="flex justify-center relative z-10">
-                            {" ".join([f'<span class="code-char">{char}</span>' for char in code])}
-                        </div>
-                    </div>
+            template = template_manager.get_template("verify")
+            return template.format(
+                theme_color=theme_color,
+                icon_html=icon_html,
+                favicon_url=favicon_url,
+                code=code,
+                session_id=session_id,
+                auth_code=auth_code,
+                redirect_uri=redirect_uri,
+                state=state,
+                client_name=client_name,
+                scope_items=scope_items,
+                group_info=group_info,
+                private_info=private_info,
+                poll_interval_ms=poll_interval_ms,
+            )
+        except Exception as e:
+            logger.error(f"加载模板失败: {e}，使用内置模板")
+            return self._render_verify_page_builtin(
+                theme_color,
+                icon_html,
+                favicon_url,
+                code,
+                session_id,
+                auth_code,
+                redirect_uri,
+                state,
+                client_name,
+                scope_items,
+                group_info,
+                private_info,
+                poll_interval_ms,
+            )
 
-                    <!-- 验证码下方的验证方式说明 -->
-                    <div class="space-y-3 mb-6 text-left">
-                        {group_info}
-                        {private_info}
-                    </div>
-
-                    <!-- 移动端显示的权限 -->
-                    <div class="mobile-only">
-                        <div class="mb-6 text-left">
-                            <p class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">请求的权限</p>
-                            <div class="space-y-2">
-                                {scope_items}
-                            </div>
-                        </div>
-                    </div>
-
-                    <div id="status" class="hidden flex items-center justify-center gap-3 py-4 px-6 bg-slate-50 rounded-2xl border border-slate-100 mb-4">
-                        <div class="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
-                        <span class="text-sm font-bold text-slate-500">等待验证中...</span>
-                    </div>
-                    
-                    <div id="successStatus" class="hidden flex items-center justify-center gap-3 py-4 px-6 bg-teal-50 rounded-2xl border border-teal-100 mb-4">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-teal-600" viewBox="0 0 20 20" fill="currentColor">
-                            <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" />
-                        </svg>
-                        <span class="text-sm font-bold text-teal-600">验证成功！</span>
-                    </div>
-                    
-                    <button id="confirmBtn" onclick="checkAndRedirect()" class="w-full py-3.5 bg-primary hover:opacity-90 text-white font-bold rounded-2xl shadow-lg shadow-primary/30 transition-all transform hover:scale-[1.02] active:scale-[0.98]">
-                        完成并继续
-                    </button>
-                    
-                    <div class="mt-6 text-rose-500 text-sm font-medium hidden" id="errorMsg"></div>
-                </div>
-            </div>
-        </div>
-        <p class="text-center text-slate-400 text-sm mt-8">Powered by <a href="https://github.com/AstrBotDevs/AstrBot" target="_blank" class="text-primary hover:opacity-80">AstrBot</a> & <a href="https://www.chuyel.cn" target="_blank" class="text-primary hover:opacity-80">初叶🍂竹叶-Furry控</a></p>
-    </div>
-
-    <script>
-        var sessionId = '{session_id}';
-        var code = '{code}';
-        var isVerified = false;
-        var redirected = false;
-        var lastClickTime = 0;
-        var CLICK_INTERVAL = 2000;
-        var checkIntervalId = null;
-        var lastPollTime = 0;
-        var POLL_INTERVAL_MS = 1000;
-        
-        function doRedirect() {{
-            if (redirected) return;
-            redirected = true;
-            window.location.href = '{redirect_uri}?code={code}&state={state}';
-        }}
-        
-        function updateUIForVerified() {{
-            if (isVerified) return;
-            isVerified = true;
-            
-            var statusEl = document.getElementById('status');
-            var successStatusEl = document.getElementById('successStatus');
-            var confirmBtn = document.getElementById('confirmBtn');
-            var errorMsg = document.getElementById('errorMsg');
-            
-            if (statusEl) statusEl.classList.add('hidden');
-            if (successStatusEl) successStatusEl.classList.remove('hidden');
-            if (confirmBtn) {{
-                confirmBtn.textContent = '验证成功，点击继续';
-                confirmBtn.classList.add('bg-teal-500');
-                confirmBtn.classList.remove('bg-primary');
-                confirmBtn.disabled = false;
-            }}
-            if (errorMsg) errorMsg.classList.add('hidden');
-        }}
-        
-        function checkAndRedirect() {{
-            var now = Date.now();
-            var errorMsg = document.getElementById('errorMsg');
-            
-            // 如果已经验证过了，直接跳转
-            if (isVerified) {{
-                doRedirect();
-                return;
-            }}
-            
-            // 检查是否在2秒冷却期内
-            if (now - lastClickTime < CLICK_INTERVAL) {{
-                errorMsg.textContent = '请稍后再试（每2秒可请求一次）';
-                errorMsg.classList.remove('hidden');
-                return;
-            }}
-            
-            lastClickTime = now;
-            errorMsg.classList.add('hidden');
-            
-            // 显示加载状态
-            var btn = document.getElementById('confirmBtn');
-            var originalText = btn.textContent;
-            btn.textContent = '检查中...';
-            btn.disabled = true;
-            
-            // 使用 XMLHttpRequest 发送请求
-            var xhr = new XMLHttpRequest();
-            var url = '../api/session/status?session_id=' + sessionId + '&_t=' + Date.now();
-            xhr.open('GET', url, true);
-            xhr.setRequestHeader('Cache-Control', 'no-cache');
-            xhr.onreadystatechange = function() {{
-                if (xhr.readyState === 4) {{
-                    if (xhr.status === 200) {{
-                        try {{
-                            var data = JSON.parse(xhr.responseText);
-                            if (data.success === true && data.verified === true) {{
-                                updateUIForVerified();
-                                // 延迟一下再跳转，让用户看到验证成功的状态
-                                setTimeout(doRedirect, 800);
-                            }} else {{
-                                errorMsg.textContent = '尚未完成验证，请在QQ中发送验证码';
-                                errorMsg.classList.remove('hidden');
-                                btn.textContent = originalText;
-                                btn.disabled = false;
-                            }}
-                        }} catch (e) {{
-                            errorMsg.textContent = '解析响应失败';
-                            errorMsg.classList.remove('hidden');
-                            btn.textContent = originalText;
-                            btn.disabled = false;
-                        }}
-                    }} else {{
-                        errorMsg.textContent = '网络错误，请重试';
-                        errorMsg.classList.remove('hidden');
-                        btn.textContent = originalText;
-                        btn.disabled = false;
-                    }}
-                }}
-            }};
-            xhr.send();
-        }}
-        
-        function checkStatus() {{
-            if (isVerified) return;
-            
-            var xhr = new XMLHttpRequest();
-            // 添加时间戳防止缓存
-            var url = '../api/session/status?session_id=' + sessionId + '&_t=' + Date.now();
-            xhr.open('GET', url, true);
-            xhr.setRequestHeader('Cache-Control', 'no-cache');
-            xhr.onreadystatechange = function() {{
-                if (xhr.readyState === 4 && xhr.status === 200) {{
-                    try {{
-                        var data = JSON.parse(xhr.responseText);
-                        if (data.success === true && data.verified === true && !isVerified) {{
-                            updateUIForVerified();
-                            // 验证成功后停止轮询
-                            if (checkIntervalId) {{
-                                clearInterval(checkIntervalId);
-                                checkIntervalId = null;
-                            }}
-                        }}
-                    }} catch (e) {{}}
-                }}
-            }};
-            xhr.send();
-        }}
-        
-        // 使用 requestAnimationFrame 保持活跃
-        function scheduleCheck(timestamp) {{
-            if (isVerified) return;
-            
-            // 如果距离上次检查超过间隔时间，执行检查
-            if (timestamp - lastPollTime >= POLL_INTERVAL_MS) {{
-                lastPollTime = timestamp;
-                checkStatus();
-            }}
-            
-            requestAnimationFrame(scheduleCheck);
-        }}
-        
-        // 页面可见性变化时立即检查（多次）
-        document.addEventListener('visibilitychange', function() {{
-            if (!document.hidden && !isVerified) {{
-                lastPollTime = 0;
-                // 立即检查，然后每隔100ms检查一次，共检查10次
-                checkStatus();
-                for (var i = 1; i <= 10; i++) {{
-                    setTimeout(function() {{
-                        if (!isVerified) checkStatus();
-                    }}, i * 100);
-                }}
-            }}
-        }});
-        
-        // 窗口获得焦点时立即检查（多次）
-        window.addEventListener('focus', function() {{
-            if (!isVerified) {{
-                lastPollTime = 0;
-                checkStatus();
-                for (var i = 1; i <= 10; i++) {{
-                    setTimeout(function() {{
-                        if (!isVerified) checkStatus();
-                    }}, i * 100);
-                }}
-            }}
-        }});
-        
-        // 点击页面任意位置时检查
-        document.addEventListener('click', function() {{
-            if (!isVerified) {{
-                checkStatus();
-            }}
-        }});
-        
-        // 鼠标移动时检查（节流）
-        var lastMouseMoveCheck = 0;
-        document.addEventListener('mousemove', function() {{
-            var now = Date.now();
-            if (!isVerified && now - lastMouseMoveCheck > 500) {{
-                lastMouseMoveCheck = now;
-                checkStatus();
-            }}
-        }});
-        
-        // 页面加载后立即开始
-        checkStatus();
-        requestAnimationFrame(scheduleCheck);
-        checkIntervalId = setInterval(checkStatus, 1000);
-    </script>
-</body>
-</html>'''
+    def _render_verify_page_builtin(
+        self,
+        theme_color: str,
+        icon_html: str,
+        favicon_url: str,
+        code: str,
+        session_id: str,
+        auth_code: str,
+        redirect_uri: str,
+        state: str,
+        client_name: str,
+        scope_items: str,
+        group_info: str,
+        private_info: str,
+        poll_interval_ms: int = 1000,
+    ) -> str:
+        """内置验证页面模板（备用）"""
+        try:
+            from .templates import template_manager
+            template = template_manager.get_template("verify")
+            return template.format(
+                theme_color=theme_color,
+                icon_html=icon_html,
+                favicon_url=favicon_url,
+                code=code,
+                session_id=session_id,
+                auth_code=auth_code,
+                redirect_uri=redirect_uri,
+                state=state,
+                client_name=client_name,
+                scope_items=scope_items,
+                group_info=group_info,
+                private_info=private_info,
+                poll_interval_ms=poll_interval_ms,
+            )
+        except Exception as e:
+            logger.error(f"加载模板失败: {e}")
+            return f'<html><body><h1>模板加载失败: {e}</h1></body></html>'
 
     def _render_verify_input_page(self, code: str, session_id: str) -> str:
+        """渲染手动验证输入页面
+
+        使用模板文件渲染验证页面，支持主题颜色、图标等自定义。
+        """
         theme_color = self._get_web_config("theme_color", "#4f46e5")
         icon_url = self._get_web_config(
             "icon_url",
@@ -2277,6 +3870,8 @@ class WebHandler:
             "favicon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
         )
+        poll_interval = self._get_web_config("poll_interval", 1)
+        poll_interval_ms = max(1000, min(30000, poll_interval * 1000))
 
         icon_html = (
             f'<img src="{icon_url}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
@@ -2284,6 +3879,28 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" /></svg>"""
         )
 
+        # 从模板文件加载
+        try:
+            from .templates import template_manager
+
+            template = template_manager.get_template("verify_input")
+            return template.format(
+                theme_color=theme_color,
+                icon_html=icon_html,
+                favicon_url=favicon_url,
+                code=code,
+                poll_interval_ms=poll_interval_ms,
+            )
+        except Exception as e:
+            logger.error(f"加载模板失败: {e}，使用内置模板")
+            return self._render_verify_input_page_builtin(
+                theme_color, icon_html, favicon_url, code, poll_interval_ms
+            )
+
+    def _render_verify_input_page_builtin(
+        self, theme_color: str, icon_html: str, favicon_url: str, code: str, poll_interval_ms: int = 1000
+    ) -> str:
+        """内置验证输入页面模板（备用）"""
         return f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2348,6 +3965,8 @@ class WebHandler:
     </div>
 
     <script>
+        var POLL_INTERVAL_MS = {poll_interval_ms};
+        
         document.getElementById('verifyForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
             const code = document.getElementById('code').value;
@@ -2394,7 +4013,7 @@ class WebHandler:
 </html>'''
 
 
-@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.2")
+@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.3")
 class ChuyeOIDCPlugin(Star):
     """OIDC 登录插件主类
 
@@ -2410,6 +4029,7 @@ class ChuyeOIDCPlugin(Star):
         self.config = config
         self.config_manager: Optional[ConfigManager] = None
         self.client_manager: Optional[ClientManager] = None
+        self.audit_log_manager: Optional[AuditLogManager] = None
         self.oidc_server: Optional[OIDCServer] = None
         self.web_handler: Optional[WebHandler] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -2430,9 +4050,20 @@ class ChuyeOIDCPlugin(Star):
 
         self.config_manager = ConfigManager(self)
         self.client_manager = ClientManager()
-        self.oidc_server = OIDCServer(self, self.config_manager, self.client_manager)
+        # 初始化审计日志管理器，使用与配置管理器相同的数据目录
+        data_dir = os.path.join(os.getcwd(), "data", "chuyeoidc")
+        self.audit_log_manager = AuditLogManager(data_dir)
+        # 初始化 SessionManager 用于会话持久化
+        self.session_manager = SessionManager(data_dir)
+        self.oidc_server = OIDCServer(
+            self, self.config_manager, self.client_manager, self.session_manager
+        )
         self.web_handler = WebHandler(
-            self, self.oidc_server, self.config_manager, self.client_manager
+            self,
+            self.oidc_server,
+            self.config_manager,
+            self.client_manager,
+            self.audit_log_manager,
         )
 
         port = self._get_config("web_port", 33145)
@@ -2466,6 +4097,10 @@ class ChuyeOIDCPlugin(Star):
     async def terminate(self):
         logger.info("OIDC登录插件正在停止...")
 
+        # 停止自动保存任务
+        if self.oidc_server:
+            self.oidc_server.stop_auto_save()
+
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
@@ -2473,19 +4108,57 @@ class ChuyeOIDCPlugin(Star):
             except asyncio.CancelledError:
                 pass
 
-        if self.oidc_server and self.oidc_server.site:
-            await self.oidc_server.site.stop()
-        if self.oidc_server and self.oidc_server.runner:
-            await self.oidc_server.runner.cleanup()
+        # 保存所有会话数据
+        if hasattr(self, "session_manager") and self.session_manager:
+            await self.session_manager.save_all()
+            logger.info("会话数据已保存")
+
+        # 停止 Web 服务（添加异常处理避免重启时出错）
+        if self.oidc_server:
+            try:
+                if self.oidc_server.site:
+                    await self.oidc_server.site.stop()
+            except Exception as e:
+                logger.debug(f"停止 site 时出错（可能已停止）: {e}")
+
+            try:
+                if self.oidc_server.runner:
+                    await self.oidc_server.runner.cleanup()
+            except Exception as e:
+                logger.debug(f"清理 runner 时出错（可能已清理）: {e}")
 
         logger.info("OIDC登录插件已停止")
 
     async def _periodic_cleanup(self):
+        """定期清理过期数据和密钥轮换
+
+        每30秒执行一次清理，确保过期验证码和令牌能及时被清理
+        同时定期执行密钥轮换
+        """
         while True:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 if self.oidc_server:
                     await self.oidc_server.cleanup_expired()
+                
+                if self.oidc_server and self.oidc_server.key_manager:
+                    try:
+                        rotated = await self.oidc_server.key_manager.rotate_keys()
+                        if rotated:
+                            self.audit_log_manager.log(
+                                action="KEY_ROTATION",
+                                details="密钥轮换成功",
+                                user="system",
+                                ip="",
+                            )
+                    except Exception as e:
+                        logger.error(f"密钥轮换失败: {e}")
+                        self.audit_log_manager.log(
+                            action="KEY_ROTATION_FAILED",
+                            details=f"密钥轮换失败: {str(e)}",
+                            user="system",
+                            ip="",
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -2555,6 +4228,11 @@ class ChuyeOIDCPlugin(Star):
 
     @filter.regex(r"^\d{4,8}$")
     async def verify_code_direct(self, event: AstrMessageEvent):
+        """直接验证码验证 - 仅验证成功时回复
+
+        为了避免频繁请求干扰用户，只有当验证码正确且验证成功时才发送成功指令。
+        验证码不存在、已过期、已使用或验证失败等情况均不回复任何消息。
+        """
         message_str = event.get_message_str().strip()
 
         if not message_str.isdigit():
@@ -2564,13 +4242,22 @@ class ChuyeOIDCPlugin(Star):
             return
 
         code = message_str
-        logger.info(f"收到验证码: {code}")
 
-        # 先检查验证码是否存在，避免不必要的群聊检查
-        if code not in self.oidc_server.verify_codes:
-            logger.info(
-                f"验证码不存在: {code}, 当前验证码列表: {list(self.oidc_server.verify_codes.keys())}"
-            )
+        # 先检查验证码是否存在且有效，避免不必要的群聊检查
+        verify_code_data = self.oidc_server.session_manager.get_verify_code(code)
+        if not verify_code_data:
+            # 验证码不存在，静默处理（不回复）
+            return
+
+        # 检查验证码是否已使用
+        if verify_code_data.get("used", False):
+            # 验证码已使用，静默处理
+            return
+
+        # 检查验证码是否过期
+        expire_seconds = self._get_web_config("code_expire_seconds", 300)
+        if time.time() - verify_code_data.get("created_at", 0) > expire_seconds:
+            # 验证码已过期，静默处理
             return
 
         # 检查群聊限制
@@ -2583,39 +4270,32 @@ class ChuyeOIDCPlugin(Star):
         enable_private_verify = self._get_web_config("enable_private_verify", True)
         verify_group_id = self._get_web_config("verify_group_id", "")
 
-        logger.info(
-            f"消息类型: {message_type}, is_group: {is_group}, group_id: {group_id}"
-        )
-        logger.info(
-            f"群聊验证启用: {enable_group_verify}, 私聊验证启用: {enable_private_verify}, 允许的群: {verify_group_id}"
-        )
-
         if is_group:
             # 群聊消息
             if not enable_group_verify:
-                logger.info("群聊验证未启用，跳过")
                 return
             # 检查是否在允许的群聊中
             allowed_groups = [
                 g.strip() for g in verify_group_id.split(",") if g.strip()
             ]
             if allowed_groups and group_id not in allowed_groups:
-                logger.info(f"群聊 {group_id} 不在允许的验证群列表中: {allowed_groups}")
                 return
         else:
             # 私聊消息
             if not enable_private_verify:
-                logger.info("私聊验证未启用，跳过")
                 return
 
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
 
+        # 执行验证
         success, result = await self.oidc_server.verify_code_submit(
             code, user_id, {"id": user_id, "name": user_name}
         )
 
+        # 只有验证成功时才发送成功指令
         if success:
-            yield event.plain_result(f"验证成功！您已通过OIDC认证。")
-        else:
-            yield event.plain_result(f"验证失败：{result}")
+            logger.info(
+                f"验证码验证成功: user_id={user_id}, session_id={result[:8]}..."
+            )
+            yield event.plain_result(f"✅ 验证成功！您已通过OIDC认证。")
