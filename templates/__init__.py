@@ -128,7 +128,12 @@ class TemplateManager:
 
         Raises:
             FileNotFoundError: 模板文件不存在
+            ValueError: 模板名称包含非法字符（路径遍历风险）
         """
+        # 验证模板路径安全，防止路径遍历攻击
+        if not self.validate_template_path(template_name):
+            raise ValueError(f"模板名称包含非法字符: {template_name}")
+
         if template_name in self._cache:
             return self._cache[template_name]
 

@@ -8,6 +8,7 @@ AstrBot OIDC 登录插件
 """
 
 import asyncio
+import hashlib
 import html
 import json
 import os
@@ -28,6 +29,41 @@ from aiohttp import web
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
+
+
+def hash_password(password: str) -> str:
+    """对密码进行哈希处理
+
+    使用 SHA-256 加盐哈希，增加安全性。
+    注意：这不是最安全的方案，生产环境建议使用 bcrypt 或 Argon2。
+
+    Args:
+        password: 明文密码
+
+    Returns:
+        哈希后的密码（格式：salt:hash）
+    """
+    salt = secrets.token_hex(16)
+    pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+    return f"{salt}:{pwd_hash}"
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    """验证密码
+
+    Args:
+        password: 明文密码
+        hashed: 哈希后的密码（格式：salt:hash）
+
+    Returns:
+        是否匹配
+    """
+    try:
+        salt, stored_hash = hashed.split(":")
+        pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+        return pwd_hash == stored_hash
+    except Exception:
+        return False
 
 
 def escape_html(text: str) -> str:
@@ -99,6 +135,64 @@ def escape_css_value(text: str) -> str:
     text = text.replace("'", "")
     text = text.replace('"', "")
     return text
+
+
+def validate_url(url: str) -> bool:
+    """验证 URL 格式是否合法
+
+    Args:
+        url: 待验证的 URL
+
+    Returns:
+        是否合法
+    """
+    if not url:
+        return True  # 空值允许（可选字段）
+    try:
+        result = urlparse(url)
+        return result.scheme in ("http", "https") and bool(result.netloc)
+    except Exception:
+        return False
+
+
+def validate_color(color: str) -> bool:
+    """验证 CSS 颜色值格式是否合法
+
+    支持格式：
+    - #RGB (如 #f0f)
+    - #RRGGBB (如 #ff00ff)
+    - #RGBA (如 #f0ff)
+    - #RRGGBBAA (如 #ff00ff00)
+
+    Args:
+        color: 待验证的颜色值
+
+    Returns:
+        是否合法
+    """
+    if not color:
+        return True  # 空值允许（使用默认值）
+    return bool(
+        re.match(
+            r"^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{4}|[0-9A-Fa-f]{8})$", color
+        )
+    )
+
+
+def validate_group_id(group_id: str) -> bool:
+    """验证群号格式是否合法
+
+    只允许数字和逗号（多个群号用逗号分隔）
+
+    Args:
+        group_id: 待验证的群号
+
+    Returns:
+        是否合法
+    """
+    if not group_id:
+        return True  # 空值允许
+    return bool(re.match(r"^[\d,]+$", group_id))
 
 
 def validate_host_header(host: str) -> bool:
@@ -550,17 +644,24 @@ class KeyManager:
         return self._load_key(key_id)
 
     def get_all_public_keys(self) -> list[dict]:
-        """获取所有活跃的公钥（用于 JWKS）
+        """获取所有公钥（包括非活跃密钥，用于 JWKS）
+
+        安全说明：
+        - 返回所有密钥（包括 is_active=False 的密钥）
+        - 这是必要的，因为旧 Token（1小时有效期）可能仍在使用
+        - 客户端需要能够验证这些旧 Token 的签名
+        - 密钥轮换后，旧公钥仍需在 JWKS 中保留一段时间
 
         Returns:
             公钥列表，每个包含 key_id 和公钥对象
         """
         keys = []
         for key_id, info in self._keys.items():
-            if info.get("is_active", True):
-                _, public_key = self._load_key(key_id)
-                if public_key:
-                    keys.append({"key_id": key_id, "public_key": public_key})
+            # 返回所有密钥，不只是活跃密钥
+            # 这是 OIDC 规范要求，确保旧 Token 仍可验证
+            _, public_key = self._load_key(key_id)
+            if public_key:
+                keys.append({"key_id": key_id, "public_key": public_key})
         return keys
 
     async def rotate_keys(self) -> bool:
@@ -1092,12 +1193,20 @@ class OIDCServer:
         # 启动自动保存任务
         self._save_task: asyncio.Task | None = None
         self._start_auto_save()
-        # 存储实际的 issuer（从 discovery 请求中获取）
-        self._issuer: str = "https://chuyeoidc.astrbot"
+        # 存储实际的 issuer（从配置中获取，不再动态设置防止 Host Header 污染）
+        self._issuer: str = ""
 
     def set_issuer(self, issuer: str):
-        """设置实际的 issuer（从 discovery 请求中获取）"""
-        self._issuer = issuer
+        """设置实际的 issuer（仅在首次 discovery 请求时设置）
+
+        安全说明：
+        - 仅在 _issuer 为空时允许设置（首次初始化）
+        - 防止攻击者通过伪造 Host Header 篡改 issuer
+        - 一旦设置，后续请求不再修改
+        """
+        if not self._issuer:
+            self._issuer = issuer
+            logger.info(f"OIDC issuer 已设置为: {issuer}")
 
     def get_issuer(self) -> str:
         """获取当前的 issuer"""
@@ -1338,6 +1447,20 @@ class OIDCServer:
     async def verify_code_submit(
         self, code: str, user_id: str, user_info: dict = None
     ) -> tuple[bool, str]:
+        """提交验证码进行验证
+
+        Args:
+            code: 验证码
+            user_id: 用户ID
+            user_info: 用户信息
+
+        Returns:
+            (是否成功, session_id 或错误信息)
+
+        安全说明：
+        - 如果 session 不存在，返回失败（防止状态不一致）
+        - 验证码使用后立即标记，防止重放攻击
+        """
         expire_seconds = self._get_web_config("code_expire_seconds", 300)
 
         async with self._lock:
@@ -1356,25 +1479,29 @@ class OIDCServer:
                 self.session_manager.delete_session(verify_code.session_id)
                 return False, "验证码已过期"
 
+            # 先检查 session 是否存在
+            session_data = self.session_manager.get_session(verify_code.session_id)
+            if not session_data:
+                logger.error(
+                    f"Session不存在: session_id={verify_code.session_id[:8]}..."
+                )
+                # Session 不存在，清理验证码防止状态不一致
+                self.session_manager.delete_verify_code(code)
+                return False, "会话不存在或已过期"
+
             # 更新验证码状态
             verify_code_data["used"] = True
             self.session_manager.set_verify_code(code, verify_code_data)
 
             # 更新会话状态
-            session_data = self.session_manager.get_session(verify_code.session_id)
-            if session_data:
-                session_data["verified"] = True
-                session_data["verified_user_id"] = user_id
-                session_data["user_info"] = user_info or {
-                    "id": user_id,
-                    "name": user_id,
-                }
-                self.session_manager.set_session(verify_code.session_id, session_data)
-                logger.info(f"验证成功: session_id={verify_code.session_id[:8]}...")
-            else:
-                logger.error(
-                    f"Session不存在: session_id={verify_code.session_id[:8]}..."
-                )
+            session_data["verified"] = True
+            session_data["verified_user_id"] = user_id
+            session_data["user_info"] = user_info or {
+                "id": user_id,
+                "name": user_id,
+            }
+            self.session_manager.set_session(verify_code.session_id, session_data)
+            logger.info(f"验证成功: session_id={verify_code.session_id[:8]}...")
 
             return True, verify_code.session_id
 
@@ -1906,14 +2033,36 @@ class WebHandler:
         return self.config_manager.get(key, default)
 
     def _check_password_default(self) -> bool:
+        """检查是否使用默认密码
+
+        检查用户名和密码是否都是默认值。
+        注意：如果密码已哈希，此方法会返回 False（因为哈希值不等于 "yeoidc"）。
+        """
         username = self._get_config("web_username", "yeoidc")
         password = self._get_config("web_password", "yeoidc")
+        # 如果密码已哈希（包含冒号），则不是默认密码
+        if ":" in password:
+            return False
         return username == "yeoidc" and password == "yeoidc"
 
     def _verify_login(self, username: str, password: str) -> bool:
+        """验证登录凭据
+
+        支持明文密码和哈希密码的验证。
+        如果配置中的密码包含冒号，则视为已哈希的密码。
+        """
         config_username = self._get_config("web_username", "yeoidc")
         config_password = self._get_config("web_password", "yeoidc")
-        return username == config_username and password == config_password
+
+        if username != config_username:
+            return False
+
+        # 检查密码是否已哈希（格式：salt:hash）
+        if ":" in config_password:
+            return verify_password(password, config_password)
+        else:
+            # 明文密码（向后兼容）
+            return password == config_password
 
     def _generate_session_token(self) -> str:
         return secrets.token_urlsafe(32)
@@ -2124,9 +2273,18 @@ class WebHandler:
             )
 
     async def handle_api_logout(self, request: web.Request) -> web.Response:
+        """处理登出请求
+
+        安全说明：
+        - 验证 token 有效性后才允许登出
+        - 无效的 token 返回 401 错误
+        """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if token in self.sessions:
-            del self.sessions[token]
+        if not self._validate_session(token):
+            return web.json_response(
+                {"success": False, "message": "未授权或会话已过期"}, status=401
+            )
+        del self.sessions[token]
         return web.json_response({"success": True})
 
     async def handle_api_check_password(self, request: web.Request) -> web.Response:
@@ -2170,6 +2328,10 @@ class WebHandler:
         return web.json_response({"success": True, "config": config_data})
 
     async def handle_api_config_save(self, request: web.Request) -> web.Response:
+        """保存配置
+
+        对输入数据进行验证，确保配置值合法。
+        """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
         if not self._validate_session(token):
             return web.json_response(
@@ -2178,6 +2340,65 @@ class WebHandler:
 
         try:
             data = await request.json()
+
+            # 验证数值范围
+            if "code_expire_seconds" in data:
+                value = data["code_expire_seconds"]
+                if not isinstance(value, int) or value < 60 or value > 3600:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "message": "验证码有效期必须在 60-3600 秒之间",
+                        },
+                        status=400,
+                    )
+
+            if "code_length" in data:
+                value = data["code_length"]
+                if not isinstance(value, int) or value < 4 or value > 10:
+                    return web.json_response(
+                        {"success": False, "message": "验证码长度必须在 4-10 位之间"},
+                        status=400,
+                    )
+
+            if "poll_interval" in data:
+                value = data["poll_interval"]
+                if not isinstance(value, int) or value < 1 or value > 30:
+                    return web.json_response(
+                        {"success": False, "message": "轮询间隔必须在 1-30 秒之间"},
+                        status=400,
+                    )
+
+            # 验证群号格式
+            if "verify_group_id" in data:
+                if not validate_group_id(data["verify_group_id"]):
+                    return web.json_response(
+                        {"success": False, "message": "群号格式无效，只允许数字和逗号"},
+                        status=400,
+                    )
+
+            # 验证 URL 格式
+            if "icon_url" in data and not validate_url(data["icon_url"]):
+                return web.json_response(
+                    {"success": False, "message": "图标 URL 格式无效"},
+                    status=400,
+                )
+
+            if "favicon_url" in data and not validate_url(data["favicon_url"]):
+                return web.json_response(
+                    {"success": False, "message": "Favicon URL 格式无效"},
+                    status=400,
+                )
+
+            # 验证颜色格式
+            if "theme_color" in data and not validate_color(data["theme_color"]):
+                return web.json_response(
+                    {
+                        "success": False,
+                        "message": "主题颜色格式无效，必须是有效的 CSS 颜色值（如 #4f46e5）",
+                    },
+                    status=400,
+                )
 
             allowed_keys = [
                 "enable_group_verify",
@@ -2276,7 +2497,7 @@ class WebHandler:
                 clients.append(
                     {
                         "client_id": client_id,
-                        "client_secret": client_data.get("client_secret", ""),
+                        "client_secret": "********",  # 隐藏敏感信息，不在列表中显示
                         "name": client_data.get("name", client_id),
                         "home_urls": home_urls,
                         "redirect_urls": redirect_urls,
@@ -2491,7 +2712,7 @@ class WebHandler:
             # 记录清空日志操作
             username = self.sessions.get(token, {}).get("username", "unknown")
             self.audit_log_manager.log(
-                action="LOGS_CLEAR",
+                action="CLEAR_LOGS",
                 details="清空审计日志",
                 user=username,
                 ip=request.remote or "",
@@ -2504,6 +2725,24 @@ class WebHandler:
             )
 
     async def handle_authorize(self, request: web.Request) -> web.Response:
+        """处理 OIDC 授权请求
+
+        安全说明：
+        - 添加了速率限制，防止滥用生成大量会话
+        - 验证 redirect_uri 是否与客户端注册的一致
+        """
+        # 速率限制检查
+        ip = request.remote or ""
+        allowed, error_msg = await self.rate_limiter.check_and_record_limit(
+            f"authorize:{ip}", ip
+        )
+        if not allowed:
+            logger.warning(f"授权端点速率限制触发: IP={ip}")
+            return web.json_response(
+                {"error": "rate_limit_exceeded", "error_description": error_msg},
+                status=429,
+            )
+
         redirect_uri = request.query.get("redirect_uri", "")
         response_type = request.query.get("response_type", "code")
         state = request.query.get("state", "")
@@ -3734,16 +3973,20 @@ class WebHandler:
 
                 function truncateUrl(url, maxLen = 20) {{
                     if (!url) return '<span class="text-slate-300">-</span>';
-                    if (url.length <= maxLen) return url;
-                    return url.substring(0, maxLen) + '...';
+                    if (url.length <= maxLen) return escapeHtml(url);
+                    return escapeHtml(url.substring(0, maxLen)) + '...';
                 }}
 
-                tbody.innerHTML = data.clients.map(c => `
+                tbody.innerHTML = data.clients.map(c => {{
+                    const safeName = escapeHtml(c.name);
+                    const safeClientId = escapeHtml(c.client_id);
+                    const safeClientSecret = escapeHtml(c.client_secret);
+                    return `
                     <tr class="hover:bg-slate-50/50 transition-colors">
                         <td class="px-6 py-4 text-sm font-bold text-slate-700">
                             <div class="flex items-center gap-2">
-                                ${{c.name}}
-                                <button onclick="copyText('${{c.name}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                ${{safeName}}
+                                <button onclick="copyText('${{safeName}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
                                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                                     </svg>
@@ -3752,8 +3995,8 @@ class WebHandler:
                         </td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <code class="bg-indigo-50 text-indigo-600 px-2 py-1 rounded-lg font-bold text-sm">${{c.client_id}}</code>
-                                <button onclick="copyText('${{c.client_id}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                <code class="bg-indigo-50 text-indigo-600 px-2 py-1 rounded-lg font-bold text-sm">${{safeClientId}}</code>
+                                <button onclick="copyText('${{safeClientId}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
                                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                                     </svg>
@@ -3762,8 +4005,8 @@ class WebHandler:
                         </td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <code class="bg-emerald-50 text-emerald-600 px-2 py-1 rounded-lg font-bold text-sm max-w-[80px] truncate" title="${{c.client_secret}}">${{c.client_secret}}</code>
-                                <button onclick="copyText('${{c.client_secret}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                <code class="bg-emerald-50 text-emerald-600 px-2 py-1 rounded-lg font-bold text-sm max-w-[80px] truncate" title="${{safeClientSecret}}">${{safeClientSecret}}</code>
+                                <button onclick="copyText('${{safeClientSecret}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
                                     <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                                     </svg>
@@ -3774,8 +4017,8 @@ class WebHandler:
                             ${{c.home_urls && c.home_urls.length > 0 ? `
                                 <div class="flex items-center gap-2">
                                     ${{c.home_urls.length === 1 ? `
-                                        <span title="${{c.home_urls[0]}}">${{truncateUrl(c.home_urls[0])}}</span>
-                                        <button onclick="copyText('${{c.home_urls[0]}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                        <span title="${{escapeHtml(c.home_urls[0])}}">${{truncateUrl(c.home_urls[0])}}</span>
+                                        <button onclick="copyText('${{escapeHtml(c.home_urls[0])}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
                                             <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                                             </svg>
@@ -3788,8 +4031,8 @@ class WebHandler:
                             ${{c.redirect_urls && c.redirect_urls.length > 0 ? `
                                 <div class="flex items-center gap-2">
                                     ${{c.redirect_urls.length === 1 ? `
-                                        <span title="${{c.redirect_urls[0]}}">${{truncateUrl(c.redirect_urls[0])}}</span>
-                                        <button onclick="copyText('${{c.redirect_urls[0]}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                        <span title="${{escapeHtml(c.redirect_urls[0])}}">${{truncateUrl(c.redirect_urls[0])}}</span>
+                                        <button onclick="copyText('${{escapeHtml(c.redirect_urls[0])}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
                                             <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
                                             </svg>
@@ -3801,12 +4044,12 @@ class WebHandler:
                         <td class="px-6 py-4 text-sm text-slate-400 font-medium">${{new Date(c.created_at * 1000).toLocaleString()}}</td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <button onclick='editClient("${{c.client_id}}", "${{c.name}}", "${{c.client_secret}}", ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
-                                <button onclick="deleteClient('${{c.client_id}}')" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
+                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
+                                <button onclick="deleteClient(${{JSON.stringify(c.client_id)}})" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
                             </div>
                         </td>
                     </tr>
-                `).join('');
+                `;}}).join('');
             }} catch (err) {{
                 console.error('加载客户端失败:', err);
             }}
@@ -4015,6 +4258,14 @@ class WebHandler:
         const logsPerPage = 20;
         let currentLogFilter = '';
 
+        // HTML 转义函数，防止 XSS 攻击
+        function escapeHtml(text) {{
+            if (text === null || text === undefined) return '';
+            const div = document.createElement('div');
+            div.textContent = String(text);
+            return div.innerHTML;
+        }}
+
         async function loadLogs() {{
             try {{
                 const response = await fetch(basePath + `api/logs?limit=${{logsPerPage}}&offset=${{currentLogPage * logsPerPage}}&action=${{currentLogFilter}}`, {{
@@ -4041,16 +4292,16 @@ class WebHandler:
                     }};
 
                     tbody.innerHTML = data.logs.map(log => {{
-                        const action = actionLabels[log.action] || {{ text: log.action, class: 'bg-slate-100 text-slate-600' }};
+                        const action = actionLabels[log.action] || {{ text: escapeHtml(log.action), class: 'bg-slate-100 text-slate-600' }};
                         return `
                             <tr class="hover:bg-slate-50/50 transition-colors">
                                 <td class="px-6 py-4 text-sm text-slate-600">${{new Date(log.timestamp * 1000).toLocaleString()}}</td>
                                 <td class="px-6 py-4">
                                     <span class="px-3 py-1 rounded-full text-xs font-bold ${{action.class}}">${{action.text}}</span>
                                 </td>
-                                <td class="px-6 py-4 text-sm text-slate-600">${{log.details || '-'}}</td>
-                                <td class="px-6 py-4 text-sm text-slate-600">${{log.user || '-'}}</td>
-                                <td class="px-6 py-4 text-sm text-slate-600 font-mono">${{log.ip || '-'}}</td>
+                                <td class="px-6 py-4 text-sm text-slate-600">${{escapeHtml(log.details) || '-'}}</td>
+                                <td class="px-6 py-4 text-sm text-slate-600">${{escapeHtml(log.user) || '-'}}</td>
+                                <td class="px-6 py-4 text-sm text-slate-600 font-mono">${{escapeHtml(log.ip) || '-'}}</td>
                             </tr>
                         `;
                     }}).join('');
@@ -4137,8 +4388,9 @@ class WebHandler:
 
         client_name = client.get("name", "未知应用") if client else "未知应用"
 
+        # 对 icon_url 进行 HTML 属性转义，防止 XSS 攻击
         icon_html = (
-            f'<img src="{icon_url}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
+            f'<img src="{escape_html_attr(icon_url)}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
             if icon_url
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>"""
         )

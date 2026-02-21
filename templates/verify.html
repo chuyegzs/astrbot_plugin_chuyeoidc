@@ -159,16 +159,16 @@
             redirected = true;
             window.location.href = '{redirect_uri}?code={auth_code}&state={state}';
         }}
-        
+
         function updateUIForVerified() {{
             if (isVerified) return;
             isVerified = true;
-            
+
             var statusEl = document.getElementById('status');
             var successStatusEl = document.getElementById('successStatus');
             var confirmBtn = document.getElementById('confirmBtn');
             var errorMsg = document.getElementById('errorMsg');
-            
+
             if (statusEl) statusEl.classList.add('hidden');
             if (successStatusEl) successStatusEl.classList.remove('hidden');
             if (confirmBtn) {{
@@ -179,34 +179,9 @@
             }}
             if (errorMsg) errorMsg.classList.add('hidden');
         }}
-        
-        function checkAndRedirect() {{
-            var now = Date.now();
-            var errorMsg = document.getElementById('errorMsg');
-            
-            // 如果已经验证过了，直接跳转
-            if (isVerified) {{
-                doRedirect();
-                return;
-            }}
-            
-            // 检查是否在2秒冷却期内
-            if (now - lastClickTime < CLICK_INTERVAL) {{
-                errorMsg.textContent = '请稍后再试（每2秒可请求一次）';
-                errorMsg.classList.remove('hidden');
-                return;
-            }}
-            
-            lastClickTime = now;
-            errorMsg.classList.add('hidden');
-            
-            // 显示加载状态
-            var btn = document.getElementById('confirmBtn');
-            var originalText = btn.textContent;
-            btn.textContent = '检查中...';
-            btn.disabled = true;
-            
-            // 使用 XMLHttpRequest 发送请求
+
+        // 通用的会话状态检查函数
+        function fetchSessionStatus(onSuccess, onError) {{
             var xhr = new XMLHttpRequest();
             var url = '../api/session/status?session_id=' + sessionId + '&_t=' + Date.now();
             xhr.open('GET', url, true);
@@ -217,56 +192,88 @@
                         try {{
                             var data = JSON.parse(xhr.responseText);
                             if (data.success === true && data.verified === true) {{
-                                updateUIForVerified();
-                                // 延迟一下再跳转，让用户看到验证成功的状态
-                                setTimeout(doRedirect, 800);
+                                onSuccess(data);
                             }} else {{
-                                errorMsg.textContent = '尚未完成验证，请在QQ中发送验证码';
-                                errorMsg.classList.remove('hidden');
-                                btn.textContent = originalText;
-                                btn.disabled = false;
+                                if (onError) onError('not_verified');
                             }}
                         }} catch (e) {{
-                            errorMsg.textContent = '解析响应失败';
-                            errorMsg.classList.remove('hidden');
-                            btn.textContent = originalText;
-                            btn.disabled = false;
+                            if (onError) onError('parse_error');
                         }}
                     }} else {{
-                        errorMsg.textContent = '网络错误，请重试';
-                        errorMsg.classList.remove('hidden');
-                        btn.textContent = originalText;
-                        btn.disabled = false;
+                        if (onError) onError('network_error');
                     }}
                 }}
             }};
             xhr.send();
         }}
+
+        function checkAndRedirect() {{
+            var now = Date.now();
+            var errorMsg = document.getElementById('errorMsg');
+
+            // 如果已经验证过了，直接跳转
+            if (isVerified) {{
+                doRedirect();
+                return;
+            }}
+
+            // 检查是否在2秒冷却期内
+            if (now - lastClickTime < CLICK_INTERVAL) {{
+                errorMsg.textContent = '请稍后再试（每2秒可请求一次）';
+                errorMsg.classList.remove('hidden');
+                return;
+            }}
+
+            lastClickTime = now;
+            errorMsg.classList.add('hidden');
+
+            // 显示加载状态
+            var btn = document.getElementById('confirmBtn');
+            var originalText = btn.textContent;
+            btn.textContent = '检查中...';
+            btn.disabled = true;
+
+            // 使用通用函数
+            fetchSessionStatus(
+                function(data) {{
+                    // 成功回调
+                    updateUIForVerified();
+                    // 延迟一下再跳转，让用户看到验证成功的状态
+                    setTimeout(doRedirect, 800);
+                }},
+                function(errorType) {{
+                    // 错误回调
+                    if (errorType === 'not_verified') {{
+                        errorMsg.textContent = '尚未完成验证，请在QQ中发送验证码';
+                    }} else if (errorType === 'parse_error') {{
+                        errorMsg.textContent = '解析响应失败';
+                    }} else if (errorType === 'network_error') {{
+                        errorMsg.textContent = '网络错误，请重试';
+                    }}
+                    errorMsg.classList.remove('hidden');
+                    btn.textContent = originalText;
+                    btn.disabled = false;
+                }}
+            );
+        }}
         
         function checkStatus() {{
             if (isVerified) return;
-            
-            var xhr = new XMLHttpRequest();
-            // 添加时间戳防止缓存
-            var url = '../api/session/status?session_id=' + sessionId + '&_t=' + Date.now();
-            xhr.open('GET', url, true);
-            xhr.setRequestHeader('Cache-Control', 'no-cache');
-            xhr.onreadystatechange = function() {{
-                if (xhr.readyState === 4 && xhr.status === 200) {{
-                    try {{
-                        var data = JSON.parse(xhr.responseText);
-                        if (data.success === true && data.verified === true && !isVerified) {{
-                            updateUIForVerified();
-                            // 验证成功后停止轮询
-                            if (checkIntervalId) {{
-                                clearInterval(checkIntervalId);
-                                checkIntervalId = null;
-                            }}
+
+            // 使用通用函数（轮询场景不需要错误处理）
+            fetchSessionStatus(
+                function(data) {{
+                    if (!isVerified) {{
+                        updateUIForVerified();
+                        // 验证成功后停止轮询
+                        if (checkIntervalId) {{
+                            clearInterval(checkIntervalId);
+                            checkIntervalId = null;
                         }}
-                    }} catch (e) {{}}
+                    }}
                 }}
-            }};
-            xhr.send();
+                // 不传入错误回调，轮询失败时静默忽略
+            );
         }}
         
         // 页面可见性变化时立即检查
