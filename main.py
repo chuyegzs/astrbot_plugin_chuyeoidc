@@ -1035,6 +1035,7 @@ class ConfigManager:
             "icon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
             "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%BA%95.png",
             "jwt_secret": "",  # JWT 签名密钥，留空则自动生成
+            "public_url": "",  # 公共访问URL，用于OIDC issuer，如 https://example.com
         }
 
         if os.path.exists(self.config_file):
@@ -1243,24 +1244,15 @@ class OIDCServer:
         # 启动自动保存任务
         self._save_task: asyncio.Task | None = None
         self._start_auto_save()
-        # 存储实际的 issuer（从配置中获取，不再动态设置防止 Host Header 污染）
-        self._issuer: str = ""
-
-    def set_issuer(self, issuer: str):
-        """设置实际的 issuer（仅在首次 discovery 请求时设置）
-
-        安全说明：
-        - 仅在 _issuer 为空时允许设置（首次初始化）
-        - 防止攻击者通过伪造 Host Header 篡改 issuer
-        - 一旦设置，后续请求不再修改
-        """
-        if not self._issuer:
-            self._issuer = issuer
-            logger.info(f"OIDC issuer 已设置为: {issuer}")
 
     def get_issuer(self) -> str:
-        """获取当前的 issuer"""
-        return self._issuer
+        """获取 OIDC issuer
+
+        从配置的 public_url 获取，确保安全性。
+        如果未配置，返回空字符串（由 discovery 端点处理）。
+        """
+        public_url = self.config_manager.get("public_url", "")
+        return public_url.rstrip("/") if public_url else ""
 
     def _get_rsa_private_key_pem(self) -> str:
         """获取 RSA 私钥 PEM 格式（用于 JWT 签名）"""
@@ -1402,7 +1394,7 @@ class OIDCServer:
         expires = now_ts + 3600
 
         payload = {
-            "iss": self._issuer,
+            "iss": self.get_issuer(),
             "sub": session.verified_user_id or "",
             "aud": session.client_id or "",
             "exp": expires,
@@ -2038,7 +2030,7 @@ class WebHandler:
             while True:
                 try:
                     await asyncio.sleep(3600)  # 每小时清理一次
-                    self._cleanup_expired_sessions()
+                    await self._cleanup_expired_sessions()
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -2046,20 +2038,24 @@ class WebHandler:
 
         self._cleanup_task = asyncio.create_task(cleanup_expired_sessions())
 
-    def _cleanup_expired_sessions(self):
-        """清理过期的 session"""
-        current_time = time.time()
-        expired_tokens = []
-        for token, session in self.sessions.items():
-            created_at = session.get("created_at", 0)
-            if current_time - created_at > self.SESSION_EXPIRE_SECONDS:
-                expired_tokens.append(token)
+    async def _cleanup_expired_sessions(self):
+        """清理过期的 session
 
-        for token in expired_tokens:
-            del self.sessions[token]
+        使用锁保护，防止并发竞争条件。
+        """
+        async with self._lock:
+            current_time = time.time()
+            expired_tokens = []
+            for token, session in self.sessions.items():
+                created_at = session.get("created_at", 0)
+                if current_time - created_at > self.SESSION_EXPIRE_SECONDS:
+                    expired_tokens.append(token)
 
-        if expired_tokens:
-            logger.info(f"清理了 {len(expired_tokens)} 个过期 session")
+            for token in expired_tokens:
+                self.sessions.pop(token, None)
+
+            if expired_tokens:
+                logger.info(f"清理了 {len(expired_tokens)} 个过期 session")
 
     async def stop_cleanup_task(self):
         """停止后台清理任务"""
@@ -2093,16 +2089,31 @@ class WebHandler:
     def _get_web_config(self, key: str, default=None):
         return self.config_manager.get(key, default)
 
+    def _is_password_hashed(self, password: str) -> bool:
+        """检查密码是否已哈希
+
+        支持检测两种哈希格式：
+        1. PBKDF2 格式: pbkdf2_sha256$iterations$salt$hash
+        2. 旧 SHA-256 格式: salt:hash
+
+        Args:
+            password: 配置中的密码值
+
+        Returns:
+            是否已哈希
+        """
+        return password.startswith("pbkdf2_sha256$") or ":" in password
+
     def _check_password_default(self) -> bool:
         """检查是否使用默认密码
 
         检查用户名和密码是否都是默认值。
-        注意：如果密码已哈希，此方法会返回 False（因为哈希值不等于 "yeoidc"）。
+        注意：如果密码已哈希，此方法会返回 False。
         """
         username = self._get_config("web_username", "yeoidc")
         password = self._get_config("web_password", "yeoidc")
-        # 如果密码已哈希（包含冒号），则不是默认密码
-        if ":" in password:
+        # 如果密码已哈希，则不是默认密码
+        if self._is_password_hashed(password):
             return False
         return username == "yeoidc" and password == "yeoidc"
 
@@ -2110,7 +2121,7 @@ class WebHandler:
         """验证登录凭据
 
         支持明文密码和哈希密码的验证。
-        如果配置中的密码包含冒号，则视为已哈希的密码。
+        自动识别密码格式（PBKDF2 或明文）。
         """
         config_username = self._get_config("web_username", "yeoidc")
         config_password = self._get_config("web_password", "yeoidc")
@@ -2118,8 +2129,8 @@ class WebHandler:
         if username != config_username:
             return False
 
-        # 检查密码是否已哈希（格式：salt:hash）
-        if ":" in config_password:
+        # 检查密码是否已哈希
+        if self._is_password_hashed(config_password):
             return verify_password(password, config_password)
         else:
             # 明文密码（向后兼容）
@@ -2172,6 +2183,24 @@ class WebHandler:
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         response.headers["Vary"] = "Origin"
+
+        # 添加安全相关的 HTTP 头部
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # 添加 Content-Security-Policy 头部，防止 XSS 攻击
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' cdn.tailwindcss.com cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' fonts.googleapis.com cdn.jsdelivr.net; "
+            "font-src fonts.gstatic.com cdn.jsdelivr.net; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self';"
+        )
 
     async def handle_root(self, request: web.Request) -> web.Response:
         """根路由处理器
@@ -2339,13 +2368,16 @@ class WebHandler:
         安全说明：
         - 验证 token 有效性后才允许登出
         - 无效的 token 返回 401 错误
+        - 使用锁保护和 pop 方法避免竞态条件
         """
         token = request.headers.get("Authorization", "").replace("Bearer ", "")
         if not await self._validate_session(token):
             return web.json_response(
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
-        del self.sessions[token]
+        # 使用锁保护和 pop 方法避免竞态条件
+        async with self._lock:
+            self.sessions.pop(token, None)
         return web.json_response({"success": True})
 
     async def handle_api_check_password(self, request: web.Request) -> web.Response:
@@ -2739,8 +2771,10 @@ class WebHandler:
             )
 
         try:
-            limit = int(request.query.get("limit", 100))
-            offset = int(request.query.get("offset", 0))
+            limit = min(
+                int(request.query.get("limit", 100)), 1000
+            )  # 限制最大1000，防止DoS
+            offset = max(0, int(request.query.get("offset", 0)))  # 确保非负
             action_filter = request.query.get("action", None)
 
             logs = self.audit_log_manager.get_logs(limit, offset, action_filter)
@@ -2854,8 +2888,9 @@ class WebHandler:
                 status=400,
             )
 
+        # 使用解码后的 redirect_uri 创建会话，确保与 token 端点比较时一致
         session_id, verify_code, auth_code = await self.oidc_server.create_auth_session(
-            redirect_uri, state, client_id
+            decoded_redirect_uri, state, client_id
         )
 
         html = self._render_verify_page(
@@ -3046,12 +3081,20 @@ class WebHandler:
                 status=400,
             )
 
-        # 使用实际请求的协议（http 或 https）
-        scheme = request.scheme
-        base_url = f"{scheme}://{host}"
-
-        # 更新 OIDCServer 的 issuer
-        self.oidc_server.set_issuer(base_url)
+        # 使用配置的 public_url 作为 issuer，确保安全性
+        # 不再从请求中动态获取，防止 Host Header 污染攻击
+        configured_issuer = self.oidc_server.get_issuer()
+        if not configured_issuer:
+            # 强制要求配置 public_url
+            logger.error("未配置 public_url，无法提供 OIDC 发现文档")
+            return web.json_response(
+                {
+                    "error": "configuration_error",
+                    "error_description": "public_url not configured",
+                },
+                status=500,
+            )
+        base_url = configured_issuer
 
         discovery = {
             "issuer": base_url,
