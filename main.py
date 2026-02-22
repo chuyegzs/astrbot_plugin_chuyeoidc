@@ -4761,6 +4761,24 @@ class ChuyeOIDCPlugin(Star):
         runner = web.AppRunner(app)
         await runner.setup()
 
+        # 检查端口是否被占用，如果被占用则等待释放
+        import socket
+
+        def is_port_in_use(port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                return s.connect_ex(("0.0.0.0", port)) == 0
+
+        max_wait = 10  # 最大等待10秒
+        waited = 0
+        while is_port_in_use(port) and waited < max_wait:
+            logger.warning(f"端口 {port} 被占用，等待释放... ({waited + 1}/{max_wait})")
+            await asyncio.sleep(1)
+            waited += 1
+
+        if is_port_in_use(port):
+            logger.error(f"端口 {port} 仍然被占用，无法启动服务")
+            raise OSError(f"端口 {port} 被占用")
+
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
 
