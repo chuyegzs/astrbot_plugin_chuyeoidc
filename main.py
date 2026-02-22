@@ -4758,9 +4758,6 @@ class ChuyeOIDCPlugin(Star):
         app = web.Application()
         app.router.add_route("*", "/{path:.*}", self.web_handler.handle_root)
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-
         # 检查端口是否被占用，如果被占用则等待释放
         import socket
 
@@ -4772,12 +4769,15 @@ class ChuyeOIDCPlugin(Star):
         waited = 0
         while is_port_in_use(port) and waited < max_wait:
             logger.warning(f"端口 {port} 被占用，等待释放... ({waited + 1}/{max_wait})")
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             waited += 1
 
         if is_port_in_use(port):
             logger.error(f"端口 {port} 仍然被占用，无法启动服务")
             raise OSError(f"端口 {port} 被占用")
+
+        runner = web.AppRunner(app)
+        await runner.setup()
 
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
