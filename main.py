@@ -1333,10 +1333,14 @@ class OIDCServer:
 
         self._save_task = asyncio.create_task(auto_save())
 
-    def stop_auto_save(self):
+    async def stop_auto_save(self):
         """停止自动保存任务"""
         if self._save_task:
             self._save_task.cancel()
+            try:
+                await self._save_task
+            except asyncio.CancelledError:
+                pass
 
     async def save_all_data(self):
         """立即保存所有会话数据"""
@@ -4799,7 +4803,7 @@ class ChuyeOIDCPlugin(Star):
 
         # 停止自动保存任务
         if self.oidc_server:
-            self.oidc_server.stop_auto_save()
+            await self.oidc_server.stop_auto_save()
 
         if self._cleanup_task:
             self._cleanup_task.cancel()
