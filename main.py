@@ -4436,8 +4436,8 @@ class WebHandler:
         try:
             from .templates import template_manager
 
-            template = template_manager.get_template("verify")
-            return template.format(
+            return template_manager.render(
+                "verify",
                 theme_color=escape_html(theme_color),
                 icon_html=icon_html,
                 favicon_url=escape_html(favicon_url),
