@@ -4809,6 +4809,9 @@ class ChuyeOIDCPlugin(Star):
             except Exception as e:
                 logger.debug(f"清理 runner 时出错（可能已清理）: {e}")
 
+            # 等待端口释放，避免重启时出现 "地址已被使用" 错误
+            await asyncio.sleep(1)
+
         logger.info("OIDC登录插件已停止")
 
     async def _periodic_cleanup(self):
