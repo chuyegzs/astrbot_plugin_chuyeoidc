@@ -4772,7 +4772,7 @@ class ChuyeOIDCPlugin(Star):
         waited = 0
         while is_port_in_use(port) and waited < max_wait:
             logger.warning(f"端口 {port} 被占用，等待释放... ({waited + 1}/{max_wait})")
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
             waited += 1
 
         if is_port_in_use(port):
