@@ -1,6 +1,6 @@
 name: astrbot_plugin_chuyeoidc
 display_name: OIDC登录插件
 desc: 用于网站OIDC登录插件，让支持OIDC登录的程序（例如NewAPI）支持QQ群聊/私聊登录
-version: v1.0.5
+version: v1.0.6
 author: 初叶🍂竹叶-Furry控
 repo: https://github.com/chuyegzs/astrbot_plugin_chuyeoidc

@@ -14,6 +14,7 @@ import html
 import os
 import re
 from collections.abc import Callable
+from typing import Dict, Optional, Union
 
 
 def escape_html(text: str) -> str:
@@ -67,6 +68,8 @@ def escape_js_string(text: str) -> str:
 def escape_css_value(text: str) -> str:
     """转义 CSS 值，防止 XSS 攻击（用于 CSS 值）
 
+    只允许安全的 CSS 颜色值格式（如 #4f46e5）
+
     Args:
         text: 需要转义的文本
 
@@ -75,6 +78,10 @@ def escape_css_value(text: str) -> str:
     """
     if not isinstance(text, str):
         text = str(text)
+    # 只允许十六进制颜色值（#RRGGBB 或 #RGB）
+    if re.match(r"^#[0-9a-fA-F]{6}$", text) or re.match(r"^#[0-9a-fA-F]{3}$", text):
+        return text
+    # 对于其他值，移除危险字符
     text = text.replace(";", "")
     text = text.replace("{", "")
     text = text.replace("}", "")
@@ -97,7 +104,7 @@ class TemplateManager:
     - 缓存机制提高性能
     """
 
-    def __init__(self, templates_dir: str | None = None):
+    def __init__(self, templates_dir: Optional[str] = None):
         """初始化模板管理器
 
         Args:
@@ -108,8 +115,8 @@ class TemplateManager:
         else:
             self.templates_dir = templates_dir
 
-        self._cache: dict[str, str] = {}
-        self._escape_functions: dict[str, Callable[[str], str]] = {
+        self._cache: Dict[str, str] = {}
+        self._escape_functions: Dict[str, Callable[[str], str]] = {
             "html": escape_html,
             "attr": escape_html_attr,
             "js": escape_js_string,
@@ -161,12 +168,20 @@ class TemplateManager:
         Returns:
             渲染后的 HTML 字符串
         """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
         template = self.get_template(template_name)
         # 使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突
         result = template
         for key, value in kwargs.items():
-            placeholder = f"{{{key}}}"
+            placeholder = "{" + key + "}"
+            count = result.count(placeholder)
             result = result.replace(placeholder, str(value))
+            logger.debug(
+                f"模板渲染: 替换 {placeholder} -> {str(value)[:30]}... (找到 {count} 处)"
+            )
         return result
 
     def render_safe(
@@ -210,7 +225,7 @@ class TemplateManager:
         return result
 
     def render_with_escapes(
-        self, template_name: str, escape_map: dict[str, str], **kwargs
+        self, template_name: str, escape_map: Dict[str, str], **kwargs
     ) -> str:
         """使用指定转义模式渲染模板
 

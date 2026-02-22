@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.5
+版本: v1.0.6
 """
 
 import asyncio
@@ -3299,153 +3299,13 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" style="width: 64px; height: 64px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>"""
         )
 
-        try:
-            # 尝试使用外部模板
-            return template_manager.render(
-                "login",
-                theme_color=escape_css_value(theme_color),
-                icon_html=icon_html,
-                favicon_url=escape_html_attr(favicon_url),
-            )
-        except (FileNotFoundError, KeyError) as e:
-            logger.warning(f"外部模板加载失败，使用内置模板: {e}")
-            return self._render_login_page_builtin(theme_color, icon_html, favicon_url)
-
-    def _render_login_page_builtin(
-        self, theme_color: str, icon_html: str, favicon_url: str
-    ) -> str:
-        """内置登录页面模板（当外部模板不可用时使用）
-
-        安全说明：
-        - 所有外部输入都经过转义处理
-        - theme_color 使用 CSS 转义
-        - favicon_url 使用 HTML 属性转义
-        """
-        return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OIDC登录 - 登录</title>
-    <link rel="icon" type="image/png" href="{escape_html_attr(favicon_url)}">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script>
-        tailwind.config = {{
-            theme: {{
-                extend: {{
-                    colors: {{
-                        primary: '{escape_js_string(theme_color)}',
-                    }}
-                }}
-            }}
-        }}
-    </script>
-    <style>
-        body {{ font-family: 'Inter', -apple-system, sans-serif; }}
-        .glass {{ background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }}
-        .bg-primary {{ background-color: {escape_css_value(theme_color)}; }}
-        .text-primary {{ color: {escape_css_value(theme_color)}; }}
-        .shadow-primary {{ box-shadow: 0 10px 15px -3px {escape_css_value(theme_color)}33; }}
-    </style>
-</head>
-<body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 bg-[radial-gradient(circle_at_top_left,_var(--tw-gradient-stops))] from-indigo-100 via-slate-50 to-teal-50">
-    <div class="max-w-md w-full">
-        <div class="glass rounded-3xl shadow-2xl shadow-primary/30 p-8 md:p-10 border border-white">
-            <div class="text-center mb-10">
-                <div class="mx-auto mb-6" style="width: 64px; height: 64px;">
-                    {icon_html}
-                </div>
-                <h1 class="text-3xl font-bold text-slate-800 tracking-tight">管理后台</h1>
-                <p class="text-slate-500 mt-2">请登录以管理您的 OIDC 服务</p>
-            </div>
-
-            <div class="bg-red-50 border border-red-100 text-red-700 px-4 py-3 rounded-xl text-sm mb-8 flex items-start gap-3 hidden" id="defaultWarning">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
-                </svg>
-                <span>您正在使用默认密码，请先在插件管理中修改密码后再登录。</span>
-            </div>
-
-            <form id="loginForm" class="space-y-6">
-                <div>
-                    <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">用户名</label>
-                    <input type="text" id="username" name="username" required
-                        class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400"
-                        placeholder="请输入用户名">
-                </div>
-                <div>
-                    <label class="block text-sm font-semibold text-slate-700 mb-2 ml-1">密码</label>
-                    <input type="password" id="password" name="password" required
-                        class="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none placeholder:text-slate-400"
-                        placeholder="请输入密码">
-                </div>
-                <button type="submit" id="loginBtn"
-                    class="w-full py-4 bg-primary hover:opacity-90 text-white rounded-2xl font-bold text-lg shadow-lg shadow-primary/30 transition-all active:scale-[0.98]">
-                    登 录
-                </button>
-            </form>
-            <div class="mt-6 text-center text-red-500 text-sm font-medium hidden" id="errorMsg"></div>
-        </div>
-        <p class="text-center text-slate-400 text-sm mt-8">Powered by <a href="https://github.com/AstrBotDevs/AstrBot" target="_blank" class="text-primary hover:opacity-80">AstrBot</a> & <a href="https://www.chuyel.cn" target="_blank" class="text-primary hover:opacity-80">初叶🍂竹叶-Furry控</a></p>
-    </div>
-
-    <script>
-        const basePath = window.location.pathname.substring(0, window.location.pathname.lastIndexOf('/')) + '/';
-
-        async function checkPasswordStatus() {{
-            try {{
-                const response = await fetch(basePath + 'api/check_password');
-                const data = await response.json();
-                if (data.success && data.is_default) {{
-                    document.getElementById('defaultWarning').classList.remove('hidden');
-                    document.getElementById('loginBtn').disabled = true;
-                    document.getElementById('loginBtn').classList.add('opacity-50', 'cursor-not-allowed');
-                }}
-            }} catch (err) {{
-                console.error('检查密码状态失败:', err);
-            }}
-        }}
-
-        checkPasswordStatus();
-
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {{
-            e.preventDefault();
-            const username = document.getElementById('username').value;
-            const password = document.getElementById('password').value;
-            const errorMsg = document.getElementById('errorMsg');
-            const btn = e.target.querySelector('button');
-
-            btn.disabled = true;
-            btn.innerHTML = '<svg class="animate-spin h-5 w-5 mx-auto" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
-
-            try {{
-                const response = await fetch(basePath + 'api/login', {{
-                    method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ username, password }})
-                }});
-                const data = await response.json();
-
-                if (data.success) {{
-                    localStorage.setItem('token', data.token);
-                    window.location.href = basePath.substring(0, basePath.length - 1);
-                }} else {{
-                    errorMsg.textContent = data.message;
-                    errorMsg.classList.remove('hidden');
-                    btn.disabled = false;
-                    btn.textContent = '登 录';
-                }}
-            }} catch (err) {{
-                errorMsg.textContent = '网络错误，请重试';
-                errorMsg.classList.remove('hidden');
-                btn.disabled = false;
-                btn.textContent = '登 录';
-            }}
-        }});
-    </script>
-</body>
-</html>"""
+        # 使用外置模板，直接传递原始值
+        return template_manager.render(
+            "login",
+            theme_color=theme_color,
+            icon_html=icon_html,
+            favicon_url=favicon_url,
+        )
 
     def _render_admin_page(
         self,
@@ -4835,7 +4695,7 @@ class WebHandler:
 </html>"""
 
 
-@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.5")
+@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.6")
 class ChuyeOIDCPlugin(Star):
     """OIDC 登录插件主类
 
