@@ -4818,17 +4818,33 @@ class ChuyeOIDCPlugin(Star):
             try:
                 if self.oidc_server.site:
                     await self.oidc_server.site.stop()
+                    logger.debug("Site 已停止")
             except Exception as e:
                 logger.debug(f"停止 site 时出错（可能已停止）: {e}")
 
             try:
                 if self.oidc_server.runner:
                     await self.oidc_server.runner.cleanup()
+                    logger.debug("Runner 已清理")
             except Exception as e:
                 logger.debug(f"清理 runner 时出错（可能已清理）: {e}")
 
+            # 强制关闭所有连接，确保端口立即释放
+            try:
+                if self.oidc_server.app:
+                    # 关闭所有活跃的连接
+                    for site in list(getattr(self.oidc_server.runner, "_sites", [])):
+                        try:
+                            await site.stop()
+                        except:
+                            pass
+            except Exception as e:
+                logger.debug(f"关闭连接时出错: {e}")
+
             # 等待端口释放，避免重启时出现 "地址已被使用" 错误
-            await asyncio.sleep(1)
+            # 需要足够长的时间让操作系统完全释放端口
+            logger.debug("等待端口释放...")
+            await asyncio.sleep(5)
 
         logger.info("OIDC登录插件已停止")
 
