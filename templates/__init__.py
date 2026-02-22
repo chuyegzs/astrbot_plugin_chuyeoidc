@@ -159,7 +159,7 @@ class TemplateManager:
         警告：此方法不进行自动转义，调用者需要确保所有变量已经过适当转义。
         建议使用 render_safe 方法进行安全渲染。
 
-        注意：使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突。
+        注意：使用双花括号 {{key}} 作为占位符，避免与 CSS/JS 中的单花括号冲突。
 
         Args:
             template_name: 模板文件名（不含扩展名）
@@ -168,20 +168,12 @@ class TemplateManager:
         Returns:
             渲染后的 HTML 字符串
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         template = self.get_template(template_name)
-        # 使用字符串替换而非 str.format，避免与 CSS/JS 中的花括号冲突
+        # 使用双花括号作为占位符，避免与 CSS/JS 中的单花括号冲突
         result = template
         for key, value in kwargs.items():
-            placeholder = "{" + key + "}"
-            count = result.count(placeholder)
+            placeholder = "{{" + key + "}}"
             result = result.replace(placeholder, str(value))
-            logger.debug(
-                f"模板渲染: 替换 {placeholder} -> {str(value)[:30]}... (找到 {count} 处)"
-            )
         return result
 
     def render_safe(

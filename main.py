@@ -1031,7 +1031,7 @@ class ConfigManager:
             "verify_group_id": "",
             "code_expire_seconds": 300,
             "code_length": 6,
-            "theme_color": "#4f46e5",
+            "theme_color": "#50b6fe",
             "icon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
             "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%BA%95.png",
             "jwt_secret": "",  # JWT 签名密钥，留空则自动生成
@@ -2258,7 +2258,7 @@ class WebHandler:
 
     async def handle_admin(self, request: web.Request) -> web.Response:
         is_default_password = self._check_password_default()
-        theme_color = self._get_web_config("theme_color", "#4f46e5")
+        theme_color = self._get_web_config("theme_color", "#50b6fe")
         icon_url = self._get_web_config(
             "icon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
@@ -2274,7 +2274,7 @@ class WebHandler:
         return web.Response(text=html, content_type="text/html", charset="utf-8")
 
     async def handle_login(self, request: web.Request) -> web.Response:
-        theme_color = self._get_web_config("theme_color", "#4f46e5")
+        theme_color = self._get_web_config("theme_color", "#50b6fe")
         icon_url = self._get_web_config(
             "icon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
@@ -2413,7 +2413,7 @@ class WebHandler:
             "code_expire_seconds": self._get_web_config("code_expire_seconds", 300),
             "code_length": self._get_web_config("code_length", 6),
             "poll_interval": self._get_web_config("poll_interval", 1),
-            "theme_color": self._get_web_config("theme_color", "#4f46e5"),
+            "theme_color": self._get_web_config("theme_color", "#50b6fe"),
             "icon_url": self._get_web_config("icon_url", ""),
             "favicon_url": self._get_web_config("favicon_url", ""),
             "jwt_secret": self._get_web_config("jwt_secret", ""),
@@ -2488,7 +2488,7 @@ class WebHandler:
                 return web.json_response(
                     {
                         "success": False,
-                        "message": "主题颜色格式无效，必须是有效的 CSS 颜色值（如 #4f46e5）",
+                        "message": "主题颜色格式无效，必须是有效的 CSS 颜色值（如 #50b6fe）",
                     },
                     status=400,
                 )
@@ -3290,7 +3290,7 @@ class WebHandler:
             )
 
     def _render_login_page(
-        self, theme_color: str = "#4f46e5", icon_url: str = "", favicon_url: str = ""
+        self, theme_color: str = "#50b6fe", icon_url: str = "", favicon_url: str = ""
     ) -> str:
         # 安全处理 icon_html，转义 URL
         icon_html = (
@@ -3310,7 +3310,7 @@ class WebHandler:
     def _render_admin_page(
         self,
         is_default_password: bool,
-        theme_color: str = "#4f46e5",
+        theme_color: str = "#50b6fe",
         icon_url: str = "",
         favicon_url: str = "",
     ) -> str:
@@ -3493,8 +3493,8 @@ class WebHandler:
                             <div>
                                 <label class="block text-sm font-bold text-slate-700 mb-2">主题色</label>
                                 <div class="flex items-center gap-4">
-                                    <input type="color" id="themeColor" class="w-16 h-12 rounded-xl border border-slate-200 cursor-pointer" value="#4f46e5">
-                                    <input type="text" id="themeColorText" class="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="#4f46e5">
+                                    <input type="color" id="themeColor" class="w-16 h-12 rounded-xl border border-slate-200 cursor-pointer" value="#50b6fe">
+                                    <input type="text" id="themeColorText" class="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="#50b6fe">
                                 </div>
                                 <p class="text-xs text-slate-500 mt-2">用于后台页面和验证页面的主题色</p>
                             </div>
@@ -3826,7 +3826,7 @@ class WebHandler:
                 document.getElementById('enablePrivateVerify').checked = config.enable_private_verify !== false;
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
 
-                const themeColor = config.theme_color || '#4f46e5';
+                const themeColor = config.theme_color || '#50b6fe';
                 document.getElementById('themeColor').value = themeColor;
                 document.getElementById('themeColorText').value = themeColor;
                 document.getElementById('iconUrl').value = config.icon_url || '';
@@ -4338,7 +4338,7 @@ class WebHandler:
         verify_group_id = self._get_web_config("verify_group_id", "")
         enable_group_verify = self._get_web_config("enable_group_verify", True)
         enable_private_verify = self._get_web_config("enable_private_verify", True)
-        theme_color = self._get_web_config("theme_color", "#4f46e5")
+        theme_color = self._get_web_config("theme_color", "#50b6fe")
         icon_url = self._get_web_config(
             "icon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
@@ -4521,7 +4521,7 @@ class WebHandler:
 
         使用模板文件渲染验证页面，支持主题颜色、图标等自定义。
         """
-        theme_color = self._get_web_config("theme_color", "#4f46e5")
+        theme_color = self._get_web_config("theme_color", "#50b6fe")
         icon_url = self._get_web_config(
             "icon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",

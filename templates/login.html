@@ -4,26 +4,26 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OIDC登录 - 登录</title>
-    <link rel="icon" type="image/png" href="{favicon_url}">
+    <link rel="icon" type="image/png" href="{{favicon_url}}">
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script>
-        tailwind.config = {{
-            theme: {{
-                extend: {{
-                    colors: {{
-                        primary: '{theme_color}',
-                    }}
-                }}
-            }}
-        }}
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '{{theme_color}}',
+                    }
+                }
+            }
+        }
     </script>
     <style>
-        body {{ font-family: 'Inter', -apple-system, sans-serif; }}
-        .glass {{ background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }}
-        .bg-primary {{ background-color: {theme_color}; }}
-        .text-primary {{ color: {theme_color}; }}
-        .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color}33; }}
+        body { font-family: 'Inter', -apple-system, sans-serif; }
+        .glass { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
+        .bg-primary { background-color: {{theme_color}}; }
+        .text-primary { color: {{theme_color}}; }
+        .shadow-primary { box-shadow: 0 10px 15px -3px {{theme_color}}33; }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen flex items-center justify-center p-4 bg-[radial-gradient(circle_at_top_left,_var(--tw-gradient-stops))] from-indigo-100 via-slate-50 to-teal-50">
@@ -31,7 +31,7 @@
         <div class="glass rounded-3xl shadow-2xl shadow-primary/30 p-8 md:p-10 border border-white">
             <div class="text-center mb-10">
                 <div class="mx-auto mb-6" style="width: 64px; height: 64px;">
-                    {icon_html}
+                    {{icon_html}}
                 </div>
                 <h1 class="text-3xl font-bold text-slate-800 tracking-tight">管理后台</h1>
                 <p class="text-slate-500 mt-2">请登录以管理您的 OIDC 服务</p>
@@ -70,23 +70,23 @@
     <script>
         const basePath = window.location.pathname.substring(0, window.location.pathname.lastIndexOf('/')) + '/';
         
-        async function checkPasswordStatus() {{
-            try {{
+        async function checkPasswordStatus() {
+            try {
                 const response = await fetch(basePath + 'api/check_password');
                 const data = await response.json();
-                if (data.success && data.is_default) {{
+                if (data.success && data.is_default) {
                     document.getElementById('defaultWarning').classList.remove('hidden');
                     document.getElementById('loginBtn').disabled = true;
                     document.getElementById('loginBtn').classList.add('opacity-50', 'cursor-not-allowed');
-                }}
-            }} catch (err) {{
+                }
+            } catch (err) {
                 console.error('检查密码状态失败:', err);
-            }}
-        }}
+            }
+        }
         
         checkPasswordStatus();
         
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {{
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const username = document.getElementById('username').value;
             const password = document.getElementById('password').value;
@@ -96,30 +96,30 @@
             btn.disabled = true;
             btn.innerHTML = '<svg class="animate-spin h-5 w-5 mx-auto" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
             
-            try {{
-                const response = await fetch(basePath + 'api/login', {{
+            try {
+                const response = await fetch(basePath + 'api/login', {
                     method: 'POST',
-                    headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ username, password }})
-                }});
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
                 const data = await response.json();
                 
-                if (data.success) {{
+                if (data.success) {
                     localStorage.setItem('token', data.token);
                     window.location.href = basePath.substring(0, basePath.length - 1);
-                }} else {{
+                } else {
                     errorMsg.textContent = data.message;
                     errorMsg.classList.remove('hidden');
                     btn.disabled = false;
                     btn.textContent = '登 录';
-                }}
-            }} catch (err) {{
+                }
+            } catch (err) {
                 errorMsg.textContent = '网络错误，请重试';
                 errorMsg.classList.remove('hidden');
                 btn.disabled = false;
                 btn.textContent = '登 录';
-            }}
-        }});
+            }
+        });
     </script>
 </body>
 </html>
