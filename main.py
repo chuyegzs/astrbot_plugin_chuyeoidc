@@ -2013,7 +2013,7 @@ class WebHandler:
             logger.warning(f"验证码验证速率限制触发: IP={ip}, 尝试次数={attempts}")
 
         self.verify_rate_limiter = RateLimiter(
-            max_attempts=10,  # 每个IP最多10次尝试
+            max_attempts=60,  # 每个IP最多60次尝试（1分钟60次）
             lockout_duration=300,  # 锁定5分钟
             window_size=60,  # 1分钟窗口
             on_rate_limit_triggered=on_verify_rate_limit_triggered,
