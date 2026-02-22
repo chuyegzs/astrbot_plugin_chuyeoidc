@@ -1558,9 +1558,17 @@ class OIDCServer:
             return True, verify_code.session_id
 
     async def get_session(self, session_id: str) -> AuthSession | None:
-        logger.info(
-            f"get_session: session_id={session_id[:8]}..., sessions count={len(self.sessions)}, keys={list(self.sessions.keys())[:5]}"
-        )
+        # 使用类变量缓存上一次的 session_id，避免相同请求重复记录日志
+        if not hasattr(self, "_last_logged_session_id"):
+            self._last_logged_session_id = None
+
+        # 只在 session_id 变化时记录日志
+        if session_id != self._last_logged_session_id:
+            logger.info(
+                f"get_session: session_id={session_id[:8]}..., sessions count={len(self.sessions)}, keys={list(self.sessions.keys())[:5]}"
+            )
+            self._last_logged_session_id = session_id
+
         session_data = self.session_manager.get_session(session_id)
         if session_data:
             return self._dict_to_session(session_data)
@@ -3271,9 +3279,16 @@ class WebHandler:
 
             session = await self.oidc_server.get_session(session_id)
             if not session:
-                return web.json_response(
-                    {"success": False, "message": "会话不存在"}, status=404
+                # 会话不存在，返回未验证状态（而不是404），避免前端显示网络错误
+                response = web.json_response(
+                    {"success": True, "verified": False, "verified_user_id": None}
                 )
+                response.headers["Cache-Control"] = (
+                    "no-cache, no-store, must-revalidate"
+                )
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+                return response
 
             # 添加缓存控制头
             response = web.json_response(
