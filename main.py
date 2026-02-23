@@ -1137,6 +1137,7 @@ class ClientManager:
         name: str = "",
         home_urls: list = None,
         redirect_urls: list = None,
+        icon_url: str = "",
     ) -> bool:
         if client_id in self._clients:
             return False
@@ -1144,6 +1145,7 @@ class ClientManager:
             "client_id": client_id,
             "client_secret": client_secret,
             "name": name or client_id,
+            "icon_url": icon_url,
             "home_urls": home_urls if home_urls else [],
             "redirect_urls": redirect_urls if redirect_urls else [],
             "created_at": time.time(),
@@ -1157,6 +1159,7 @@ class ClientManager:
         name: str = None,
         home_urls: list = None,
         redirect_urls: list = None,
+        icon_url: str = None,
     ) -> bool:
         if client_id not in self._clients:
             return False
@@ -1164,6 +1167,8 @@ class ClientManager:
             self._clients[client_id]["client_secret"] = client_secret
         if name is not None:
             self._clients[client_id]["name"] = name
+        if icon_url is not None:
+            self._clients[client_id]["icon_url"] = icon_url
         if home_urls is not None:
             self._clients[client_id]["home_urls"] = home_urls
         if redirect_urls is not None:
@@ -1558,16 +1563,25 @@ class OIDCServer:
             return True, verify_code.session_id
 
     async def get_session(self, session_id: str) -> AuthSession | None:
-        # 使用类变量缓存上一次的 session_id，避免相同请求重复记录日志
+        # 使用类变量缓存上一次的 session_id 和日志时间，避免相同请求重复记录日志
         if not hasattr(self, "_last_logged_session_id"):
             self._last_logged_session_id = None
+        if not hasattr(self, "_last_logged_time"):
+            self._last_logged_time = 0
 
-        # 只在 session_id 变化时记录日志
-        if session_id != self._last_logged_session_id:
+        import time
+
+        current_time = time.time()
+        # 只在 session_id 变化或超过5秒间隔时才记录日志
+        if (
+            session_id != self._last_logged_session_id
+            or (current_time - self._last_logged_time) > 5
+        ):
             logger.info(
                 f"get_session: session_id={session_id[:8]}..., sessions count={len(self.sessions)}, keys={list(self.sessions.keys())[:5]}"
             )
             self._last_logged_session_id = session_id
+            self._last_logged_time = current_time
 
         session_data = self.session_manager.get_session(session_id)
         if session_data:
@@ -1803,6 +1817,18 @@ class RateLimiter:
         self._lockouts: dict[str, float] = {}  # key -> lockout_end_time
         self._lock = asyncio.Lock()
 
+    def update_params(self, max_attempts: int = None, window_size: int = None):
+        """更新速率限制参数
+
+        Args:
+            max_attempts: 新的最大尝试次数
+            window_size: 新的时间窗口大小
+        """
+        if max_attempts is not None:
+            self.max_attempts = max_attempts
+        if window_size is not None:
+            self.window_size = window_size
+
     def _get_key(self, identifier: str, ip: str = "") -> str:
         """生成唯一标识键"""
         if ip:
@@ -2024,8 +2050,13 @@ class WebHandler:
             )
             logger.warning(f"验证码验证速率限制触发: IP={ip}, 尝试次数={attempts}")
 
+        # 从配置读取IP速率限制，默认60次/分钟
+        ip_rate_limit = self._get_web_config("ip_rate_limit", 60)
+        if ip_rate_limit == 0:
+            ip_rate_limit = 999999  # 0表示无限制
+
         self.verify_rate_limiter = RateLimiter(
-            max_attempts=60,  # 每个IP最多60次尝试（1分钟60次）
+            max_attempts=ip_rate_limit,  # 每个IP最多请求次数
             lockout_duration=300,  # 锁定5分钟
             window_size=60,  # 1分钟窗口
             on_rate_limit_triggered=on_verify_rate_limit_triggered,
@@ -2425,6 +2456,10 @@ class WebHandler:
             "code_expire_seconds": self._get_web_config("code_expire_seconds", 300),
             "code_length": self._get_web_config("code_length", 6),
             "poll_interval": self._get_web_config("poll_interval", 1),
+            "ip_rate_limit": self._get_web_config("ip_rate_limit", 60),
+            "verify_success_message": self._get_web_config(
+                "verify_success_message", ""
+            ),
             "theme_color": self._get_web_config("theme_color", "#50b6fe"),
             "icon_url": self._get_web_config("icon_url", ""),
             "favicon_url": self._get_web_config("favicon_url", ""),
@@ -2474,6 +2509,18 @@ class WebHandler:
                         status=400,
                     )
 
+            # 验证单IP请求速率限制
+            if "ip_rate_limit" in data:
+                value = data["ip_rate_limit"]
+                if not isinstance(value, int) or value < 0 or value > 10000:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "message": "单IP请求速率限制必须在 0-10000 之间",
+                        },
+                        status=400,
+                    )
+
             # 验证群号格式
             if "verify_group_id" in data:
                 if not validate_group_id(data["verify_group_id"]):
@@ -2512,6 +2559,8 @@ class WebHandler:
                 "code_expire_seconds",
                 "code_length",
                 "poll_interval",
+                "ip_rate_limit",
+                "verify_success_message",
                 "theme_color",
                 "icon_url",
                 "favicon_url",
@@ -2524,6 +2573,18 @@ class WebHandler:
                     update_data[key] = data[key]
 
             if self.config_manager.update(update_data):
+                # 如果更新了IP速率限制，更新速率限制器
+                if "ip_rate_limit" in update_data:
+                    ip_rate_limit = update_data["ip_rate_limit"]
+                    if ip_rate_limit == 0:
+                        # 0表示无限制，设置一个很大的值
+                        self.verify_rate_limiter.update_params(max_attempts=999999)
+                    else:
+                        self.verify_rate_limiter.update_params(
+                            max_attempts=ip_rate_limit
+                        )
+                    logger.info(f"IP速率限制已更新为: {ip_rate_limit}")
+
                 # 记录配置更新审计日志
                 username = self.sessions.get(token, {}).get("username", "unknown")
                 self.audit_log_manager.log(
@@ -2602,8 +2663,11 @@ class WebHandler:
                 clients.append(
                     {
                         "client_id": client_id,
-                        "client_secret": "********",  # 隐藏敏感信息，不在列表中显示
+                        "client_secret": client_data.get(
+                            "client_secret", ""
+                        ),  # 返回真实secret，方便管理
                         "name": client_data.get("name", client_id),
+                        "icon_url": client_data.get("icon_url", ""),
                         "home_urls": home_urls,
                         "redirect_urls": redirect_urls,
                         "created_at": client_data.get("created_at", 0),
@@ -2629,6 +2693,7 @@ class WebHandler:
             client_id = data.get("client_id", "")
             client_secret = data.get("client_secret", "")
             name = data.get("name", "")
+            icon_url = data.get("icon_url", "")
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2646,7 +2711,7 @@ class WebHandler:
                 redirect_urls = [data.get("redirect_url")]
 
             if self.client_manager.add_client(
-                client_id, client_secret, name, home_urls, redirect_urls
+                client_id, client_secret, name, home_urls, redirect_urls, icon_url
             ):
                 # 记录客户端创建审计日志
                 username = self.sessions.get(token, {}).get("username", "unknown")
@@ -2664,6 +2729,7 @@ class WebHandler:
                             "client_id": client_id,
                             "client_secret": client_secret,
                             "name": name,
+                            "icon_url": icon_url,
                             "home_urls": home_urls,
                             "redirect_urls": redirect_urls,
                         },
@@ -2691,6 +2757,7 @@ class WebHandler:
             client_id = data.get("client_id", "")
             client_secret = data.get("client_secret", "")
             name = data.get("name", "")
+            icon_url = data.get("icon_url", "")
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2706,7 +2773,7 @@ class WebHandler:
                 redirect_urls = [data.get("redirect_url")]
 
             if self.client_manager.update_client(
-                client_id, client_secret, name, home_urls, redirect_urls
+                client_id, client_secret, name, home_urls, redirect_urls, icon_url
             ):
                 # 记录客户端更新审计日志
                 username = self.sessions.get(token, {}).get("username", "unknown")
@@ -3554,6 +3621,11 @@ class WebHandler:
                                 <input type="number" id="pollInterval" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="1" max="30">
                                 <p class="text-xs text-slate-500 mt-2">验证页面检查状态的时间间隔，范围 1-30 秒</p>
                             </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">单IP请求速率限制 (次/分钟)</label>
+                                <input type="number" id="ipRateLimit" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" max="10000">
+                                <p class="text-xs text-slate-500 mt-2">每个IP每分钟最多请求次数，0为无限制，建议30-10000</p>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -3586,6 +3658,13 @@ class WebHandler:
                                 <input type="checkbox" id="enablePrivateVerify" class="sr-only peer">
                                 <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
                             </label>
+                        </div>
+
+                        <!-- 自定义验证成功消息 -->
+                        <div class="pt-4 border-t border-slate-100">
+                            <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
+                            <textarea id="verifySuccessMessage" rows="3" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。"></textarea>
+                            <p class="text-xs text-slate-500 mt-2">用户验证成功后发送的自定义消息，留空使用默认消息</p>
                         </div>
                     </div>
                 </div>
@@ -3648,6 +3727,11 @@ class WebHandler:
                         <div>
                             <label class="block text-sm font-bold text-slate-700 mb-2">Client Secret (留空自动生成)</label>
                             <input type="text" id="newClientSecret" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="留空自动生成">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-bold text-slate-700 mb-2">客户端图标 URL</label>
+                            <input type="text" id="newClientIconUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="留空使用默认图标">
+                            <p class="text-xs text-slate-500 mt-2">建议尺寸 64x64</p>
                         </div>
                         <div class="md:col-span-2">
                             <label class="block text-sm font-bold text-slate-700 mb-2">主页链接</label>
@@ -3755,11 +3839,11 @@ class WebHandler:
                             <table class="w-full text-left border-collapse">
                                 <thead class="sticky top-0 bg-white z-10">
                                     <tr class="bg-slate-50/50 border-b border-slate-100">
-                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">时间</th>
-                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">操作类型</th>
-                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">详情</th>
-                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">用户</th>
-                                        <th class="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">IP地址</th>
+                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-28">时间</th>
+                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-36">操作类型</th>
+                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">详情</th>
+                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-20">用户</th>
+                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-28">IP地址</th>
                                     </tr>
                                 </thead>
                                 <tbody id="logTable" class="divide-y divide-slate-100">
@@ -3841,9 +3925,11 @@ class WebHandler:
                 document.getElementById('codeLength').value = config.code_length || 6;
                 document.getElementById('codeExpire').value = config.code_expire_seconds || 300;
                 document.getElementById('pollInterval').value = config.poll_interval || 1;
+                document.getElementById('ipRateLimit').value = config.ip_rate_limit || 60;
                 document.getElementById('enableGroupVerify').checked = config.enable_group_verify !== false;
                 document.getElementById('enablePrivateVerify').checked = config.enable_private_verify !== false;
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
+                document.getElementById('verifySuccessMessage').value = config.verify_success_message || '';
 
                 const themeColor = config.theme_color || '#50b6fe';
                 document.getElementById('themeColor').value = themeColor;
@@ -3872,9 +3958,11 @@ class WebHandler:
                 code_length: parseInt(document.getElementById('codeLength').value),
                 code_expire_seconds: parseInt(document.getElementById('codeExpire').value),
                 poll_interval: parseInt(document.getElementById('pollInterval').value),
+                ip_rate_limit: parseInt(document.getElementById('ipRateLimit').value),
                 enable_group_verify: document.getElementById('enableGroupVerify').checked,
                 enable_private_verify: document.getElementById('enablePrivateVerify').checked,
                 verify_group_id: document.getElementById('verifyGroupId').value,
+                verify_success_message: document.getElementById('verifySuccessMessage').value,
                 theme_color: document.getElementById('themeColor').value,
                 icon_url: document.getElementById('iconUrl').value,
                 favicon_url: document.getElementById('faviconUrl').value
@@ -3964,16 +4052,21 @@ class WebHandler:
                     const safeName = escapeHtml(c.name);
                     const safeClientId = escapeHtml(c.client_id);
                     const safeClientSecret = escapeHtml(c.client_secret);
+                    const iconUrl = c.icon_url || '';
+                    const iconHtml = iconUrl ? `<img src="${{escapeHtml(iconUrl)}}" class="w-8 h-8 rounded-lg object-cover" alt="">` : `<div class="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary font-bold text-sm">${{safeName.charAt(0).toUpperCase()}}</div>`;
                     return `
                     <tr class="hover:bg-slate-50/50 transition-colors">
                         <td class="px-6 py-4 text-sm font-bold text-slate-700">
-                            <div class="flex items-center gap-2">
-                                ${{safeName}}
-                                <button onclick="copyText('${{safeName}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
-                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                    </svg>
-                                </button>
+                            <div class="flex items-center gap-3">
+                                ${{iconHtml}}
+                                <div class="flex items-center gap-2">
+                                    ${{safeName}}
+                                    <button onclick="copyText('${{safeName}}')" class="text-slate-400 hover:text-indigo-600 transition-colors" title="复制">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                        </svg>
+                                    </button>
+                                </div>
                             </div>
                         </td>
                         <td class="px-6 py-4">
@@ -4027,7 +4120,7 @@ class WebHandler:
                         <td class="px-6 py-4 text-sm text-slate-400 font-medium">${{new Date(c.created_at * 1000).toLocaleString()}}</td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
+                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
                                 <button onclick="deleteClient(${{JSON.stringify(c.client_id)}})" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
                             </div>
                         </td>
@@ -4108,11 +4201,12 @@ class WebHandler:
             document.getElementById('cancelEditBtn').classList.add('hidden');
         }}
 
-        function editClient(clientId, name, clientSecret, homeUrls, redirectUrls) {{
+        function editClient(clientId, name, clientSecret, iconUrl, homeUrls, redirectUrls) {{
             editingClientId = clientId;
             document.getElementById('newClientName').value = name || '';
             document.getElementById('newClientId').value = clientId || '';
             document.getElementById('newClientSecret').value = clientSecret || '';
+            document.getElementById('newClientIconUrl').value = iconUrl || '';
 
             // 设置主页链接
             const homeUrlsContainer = document.getElementById('homeUrlsContainer');
@@ -4143,6 +4237,7 @@ class WebHandler:
             const name = document.getElementById('newClientName').value;
             const client_id = document.getElementById('newClientId').value;
             const client_secret = document.getElementById('newClientSecret').value;
+            const icon_url = document.getElementById('newClientIconUrl').value;
             const home_urls = getHomeUrls();
             const redirect_urls = getRedirectUrls();
 
@@ -4171,6 +4266,7 @@ class WebHandler:
                         name: name,
                         client_id: client_id,
                         client_secret: client_secret,
+                        icon_url: icon_url,
                         home_urls: home_urls,
                         redirect_urls: redirect_urls
                     }})
@@ -4278,13 +4374,13 @@ class WebHandler:
                         const action = actionLabels[log.action] || {{ text: escapeHtml(log.action), class: 'bg-slate-100 text-slate-600' }};
                         return `
                             <tr class="hover:bg-slate-50/50 transition-colors">
-                                <td class="px-6 py-4 text-sm text-slate-600">${{new Date(log.timestamp * 1000).toLocaleString()}}</td>
-                                <td class="px-6 py-4">
-                                    <span class="px-3 py-1 rounded-full text-xs font-bold ${{action.class}}">${{action.text}}</span>
+                                <td class="px-3 py-4 text-sm text-slate-600">${{new Date(log.timestamp * 1000).toLocaleString()}}</td>
+                                <td class="px-3 py-4">
+                                    <span class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ${{action.class}}">${{action.text}}</span>
                                 </td>
-                                <td class="px-6 py-4 text-sm text-slate-600">${{escapeHtml(log.details) || '-'}}</td>
-                                <td class="px-6 py-4 text-sm text-slate-600">${{escapeHtml(log.user) || '-'}}</td>
-                                <td class="px-6 py-4 text-sm text-slate-600 font-mono">${{escapeHtml(log.ip) || '-'}}</td>
+                                <td class="px-3 py-4 text-sm text-slate-600">${{escapeHtml(log.details) || '-'}}</td>
+                                <td class="px-3 py-4 text-sm text-slate-600">${{escapeHtml(log.user) || '-'}}</td>
+                                <td class="px-3 py-4 text-sm text-slate-600 font-mono">${{escapeHtml(log.ip) || '-'}}</td>
                             </tr>
                         `;
                     }}).join('');
@@ -4371,10 +4467,14 @@ class WebHandler:
 
         client_name = client.get("name", "未知应用") if client else "未知应用"
 
+        # 优先使用客户端设置的图标URL，如果没有则使用全局图标URL
+        client_icon_url = client.get("icon_url", "") if client else ""
+        final_icon_url = client_icon_url if client_icon_url else icon_url
+
         # 对 icon_url 进行 HTML 属性转义，防止 XSS 攻击
         icon_html = (
-            f'<img src="{escape_html_attr(icon_url)}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
-            if icon_url
+            f'<img src="{escape_html_attr(final_icon_url)}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
+            if final_icon_url
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>"""
         )
 
@@ -4960,7 +5060,12 @@ class ChuyeOIDCPlugin(Star):
         )
 
         if success:
-            yield event.plain_result("验证成功！您已通过OIDC认证。")
+            # 使用自定义验证成功消息，如果没有设置则使用默认消息
+            custom_message = self._get_web_config("verify_success_message", "")
+            if custom_message:
+                yield event.plain_result(custom_message)
+            else:
+                yield event.plain_result("验证成功！您已通过OIDC认证。")
         else:
             yield event.plain_result(f"验证失败：{result}")
 
@@ -5036,4 +5141,9 @@ class ChuyeOIDCPlugin(Star):
             logger.info(
                 f"验证码验证成功: user_id={user_id}, session_id={result[:8]}..."
             )
-            yield event.plain_result("✅ 验证成功！您已通过OIDC认证。")
+            # 使用自定义验证成功消息，如果没有设置则使用默认消息
+            custom_message = self._get_web_config("verify_success_message", "")
+            if custom_message:
+                yield event.plain_result(custom_message)
+            else:
+                yield event.plain_result("验证成功！您已通过OIDC认证。")
