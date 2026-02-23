@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.6
+版本: v1.0.7
 """
 
 import asyncio
@@ -4814,7 +4814,7 @@ class WebHandler:
 </html>"""
 
 
-@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.6")
+@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.7")
 class ChuyeOIDCPlugin(Star):
     """OIDC 登录插件主类
 
