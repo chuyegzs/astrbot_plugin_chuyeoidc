@@ -68,7 +68,16 @@
     </div>
 
     <script>
-        const basePath = window.location.pathname.substring(0, window.location.pathname.lastIndexOf('/')) + '/';
+        // 计算基础路径，确保以 / 结尾
+        let basePath = window.location.pathname;
+        if (basePath.endsWith('/login')) {
+            basePath = basePath.substring(0, basePath.length - 5); // 移除 'login'
+        } else if (basePath.endsWith('/login/')) {
+            basePath = basePath.substring(0, basePath.length - 6); // 移除 'login/'
+        }
+        if (!basePath.endsWith('/')) {
+            basePath += '/';
+        }
         
         async function checkPasswordStatus() {
             try {
@@ -106,7 +115,8 @@
                 
                 if (data.success) {
                     localStorage.setItem('token', data.token);
-                    window.location.href = basePath.substring(0, basePath.length - 1);
+                    // 跳转到管理后台首页，保持路径一致
+                    window.location.href = basePath;
                 } else {
                     errorMsg.textContent = data.message;
                     errorMsg.classList.remove('hidden');

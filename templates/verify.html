@@ -6,7 +6,7 @@
     <title>OIDC 验证 - 身份验证</title>
     <link rel="icon" type="image/png" href="{{favicon_url}}">
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    {{custom_font_link}}
     <script>
         tailwind.config = {
             theme: {
@@ -19,7 +19,7 @@
         }
     </script>
     <style>
-        body { font-family: 'Inter', -apple-system, sans-serif; }
+        body { font-family: {{custom_font_family}}; }
         .glass { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
         .code-char { display: inline-block; width: 3rem; height: 4rem; line-height: 4rem; background: white; border-radius: 1rem; margin: 0 0.25rem; font-size: 2rem; font-weight: 800; color: {{theme_color}}; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
         .bg-primary { background-color: {{theme_color}}; }

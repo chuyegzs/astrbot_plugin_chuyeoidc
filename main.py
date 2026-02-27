@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.7
+版本: v1.0.8
 """
 
 import asyncio
@@ -1138,6 +1138,10 @@ class ClientManager:
         home_urls: list = None,
         redirect_urls: list = None,
         icon_url: str = "",
+        enable_group_verify: bool = True,
+        enable_private_verify: bool = True,
+        verify_group_id: str = "",
+        verify_success_message: str = "",
     ) -> bool:
         if client_id in self._clients:
             return False
@@ -1148,6 +1152,10 @@ class ClientManager:
             "icon_url": icon_url,
             "home_urls": home_urls if home_urls else [],
             "redirect_urls": redirect_urls if redirect_urls else [],
+            "enable_group_verify": enable_group_verify,
+            "enable_private_verify": enable_private_verify,
+            "verify_group_id": verify_group_id,
+            "verify_success_message": verify_success_message,
             "created_at": time.time(),
         }
         return self._save_clients()
@@ -1160,6 +1168,10 @@ class ClientManager:
         home_urls: list = None,
         redirect_urls: list = None,
         icon_url: str = None,
+        enable_group_verify: bool = None,
+        enable_private_verify: bool = None,
+        verify_group_id: str = None,
+        verify_success_message: str = None,
     ) -> bool:
         if client_id not in self._clients:
             return False
@@ -1169,6 +1181,14 @@ class ClientManager:
             self._clients[client_id]["name"] = name
         if icon_url is not None:
             self._clients[client_id]["icon_url"] = icon_url
+        if enable_group_verify is not None:
+            self._clients[client_id]["enable_group_verify"] = enable_group_verify
+        if enable_private_verify is not None:
+            self._clients[client_id]["enable_private_verify"] = enable_private_verify
+        if verify_group_id is not None:
+            self._clients[client_id]["verify_group_id"] = verify_group_id
+        if verify_success_message is not None:
+            self._clients[client_id]["verify_success_message"] = verify_success_message
         if home_urls is not None:
             self._clients[client_id]["home_urls"] = home_urls
         if redirect_urls is not None:
@@ -1618,11 +1638,21 @@ class OIDCServer:
                 return None
 
             # 验证 redirect_uri 是否与授权时一致（OIDC 安全要求）
+            # 或者是否在客户端允许的 redirect_urls 列表中
             if redirect_uri and session.redirect_uri != redirect_uri:
-                logger.warning(
-                    f"redirect_uri不匹配: expected={session.redirect_uri}, got={redirect_uri}"
-                )
-                return None
+                # 检查请求的 redirect_uri 是否在客户端允许的列表中
+                client = self.client_manager.get_client(session.client_id)
+                if client and self.client_manager.verify_redirect_uri(
+                    session.client_id, redirect_uri
+                ):
+                    logger.info(
+                        f"redirect_uri 与授权时不一致，但在客户端允许列表中: {redirect_uri}"
+                    )
+                else:
+                    logger.warning(
+                        f"redirect_uri不匹配: expected={session.redirect_uri}, got={redirect_uri}"
+                    )
+                    return None
 
             # 防止授权码重放：立即删除会话，使授权码失效
             self.session_manager.delete_session(session_id)
@@ -2445,6 +2475,19 @@ class WebHandler:
                 {"success": False, "message": "未授权或会话已过期"}, status=401
             )
 
+        # 获取当前IP和各个header的值
+        ip_headers = {
+            "HTTP_X_FORWARDED_FOR": request.headers.get("X-Forwarded-For", ""),
+            "HTTP_X_REAL_IP": request.headers.get("X-Real-IP", ""),
+            "REMOTE_ADDR": request.remote or "",
+            "HTTP_CLIENT_IP": request.headers.get("Client-IP", ""),
+            "HTTP_X_FORWARDED": request.headers.get("X-Forwarded", ""),
+            "HTTP_X_CLUSTER_CLIENT_IP": request.headers.get("X-Cluster-Client-IP", ""),
+            "HTTP_FORWARDED_FOR": request.headers.get("Forwarded-For", ""),
+            "HTTP_FORWARDED": request.headers.get("Forwarded", ""),
+            "HTTP_CF_CONNECTING_IP": request.headers.get("CF-Connecting-IP", ""),
+        }
+
         config_data = {
             "web_port": self._get_config("web_port", 33145),
             "secure_path": self._get_config("secure_path", "chuyeoidc"),
@@ -2464,6 +2507,16 @@ class WebHandler:
             "icon_url": self._get_web_config("icon_url", ""),
             "favicon_url": self._get_web_config("favicon_url", ""),
             "jwt_secret": self._get_web_config("jwt_secret", ""),
+            "custom_font_url": self._get_web_config("custom_font_url", ""),
+            "cdn_ip_method": self._get_web_config("cdn_ip_method", ""),
+            "pc_wallpaper_url": self._get_web_config("pc_wallpaper_url", ""),
+            "mobile_wallpaper_url": self._get_web_config("mobile_wallpaper_url", ""),
+            "ip_headers": ip_headers,
+            "current_ip": (
+                self.plugin._get_client_ip(request)
+                if hasattr(self.plugin, "_get_client_ip")
+                else (request.remote or "")
+            ),
         }
         return web.json_response({"success": True, "config": config_data})
 
@@ -2565,6 +2618,10 @@ class WebHandler:
                 "icon_url",
                 "favicon_url",
                 "jwt_secret",
+                "custom_font_url",
+                "cdn_ip_method",
+                "pc_wallpaper_url",
+                "mobile_wallpaper_url",
             ]
 
             update_data = {}
@@ -2668,6 +2725,16 @@ class WebHandler:
                         ),  # 返回真实secret，方便管理
                         "name": client_data.get("name", client_id),
                         "icon_url": client_data.get("icon_url", ""),
+                        "enable_group_verify": client_data.get(
+                            "enable_group_verify", True
+                        ),
+                        "enable_private_verify": client_data.get(
+                            "enable_private_verify", True
+                        ),
+                        "verify_group_id": client_data.get("verify_group_id", ""),
+                        "verify_success_message": client_data.get(
+                            "verify_success_message", ""
+                        ),
                         "home_urls": home_urls,
                         "redirect_urls": redirect_urls,
                         "created_at": client_data.get("created_at", 0),
@@ -2694,6 +2761,10 @@ class WebHandler:
             client_secret = data.get("client_secret", "")
             name = data.get("name", "")
             icon_url = data.get("icon_url", "")
+            enable_group_verify = data.get("enable_group_verify", True)
+            enable_private_verify = data.get("enable_private_verify", True)
+            verify_group_id = data.get("verify_group_id", "")
+            verify_success_message = data.get("verify_success_message", "")
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2711,7 +2782,16 @@ class WebHandler:
                 redirect_urls = [data.get("redirect_url")]
 
             if self.client_manager.add_client(
-                client_id, client_secret, name, home_urls, redirect_urls, icon_url
+                client_id,
+                client_secret,
+                name,
+                home_urls,
+                redirect_urls,
+                icon_url,
+                enable_group_verify,
+                enable_private_verify,
+                verify_group_id,
+                verify_success_message,
             ):
                 # 记录客户端创建审计日志
                 username = self.sessions.get(token, {}).get("username", "unknown")
@@ -2730,6 +2810,10 @@ class WebHandler:
                             "client_secret": client_secret,
                             "name": name,
                             "icon_url": icon_url,
+                            "enable_group_verify": enable_group_verify,
+                            "enable_private_verify": enable_private_verify,
+                            "verify_group_id": verify_group_id,
+                            "verify_success_message": verify_success_message,
                             "home_urls": home_urls,
                             "redirect_urls": redirect_urls,
                         },
@@ -2758,6 +2842,10 @@ class WebHandler:
             client_secret = data.get("client_secret", "")
             name = data.get("name", "")
             icon_url = data.get("icon_url", "")
+            enable_group_verify = data.get("enable_group_verify")
+            enable_private_verify = data.get("enable_private_verify")
+            verify_group_id = data.get("verify_group_id")
+            verify_success_message = data.get("verify_success_message")
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2773,7 +2861,16 @@ class WebHandler:
                 redirect_urls = [data.get("redirect_url")]
 
             if self.client_manager.update_client(
-                client_id, client_secret, name, home_urls, redirect_urls, icon_url
+                client_id,
+                client_secret,
+                name,
+                home_urls,
+                redirect_urls,
+                icon_url,
+                enable_group_verify,
+                enable_private_verify,
+                verify_group_id,
+                verify_success_message,
             ):
                 # 记录客户端更新审计日志
                 username = self.sessions.get(token, {}).get("username", "unknown")
@@ -2856,8 +2953,20 @@ class WebHandler:
             offset = max(0, int(request.query.get("offset", 0)))  # 确保非负
             action_filter = request.query.get("action", None)
 
+            logger.info(
+                f"获取审计日志: limit={limit}, offset={offset}, action_filter={action_filter}"
+            )
+
+            if not self.audit_log_manager:
+                logger.error("审计日志管理器未初始化")
+                return web.json_response(
+                    {"success": False, "message": "审计日志管理器未初始化"}, status=500
+                )
+
             logs = self.audit_log_manager.get_logs(limit, offset, action_filter)
             total = self.audit_log_manager.get_logs_count(action_filter)
+
+            logger.info(f"审计日志查询结果: total={total}, logs_count={len(logs)}")
 
             return web.json_response(
                 {
@@ -2871,7 +2980,7 @@ class WebHandler:
         except Exception as e:
             logger.error(f"获取审计日志错误: {e}")
             return web.json_response(
-                {"success": False, "message": "服务器错误"}, status=500
+                {"success": False, "message": f"服务器错误: {str(e)}"}, status=500
             )
 
     async def handle_api_logs_clear(self, request: web.Request) -> web.Response:
@@ -2979,19 +3088,37 @@ class WebHandler:
 
     async def handle_token(self, request: web.Request) -> web.Response:
         content_type = request.headers.get("Content-Type", "")
-        logger.info(f"Token请求: content_type={content_type}")
+        client_ip = (
+            self.plugin._get_client_ip(request)
+            if hasattr(self.plugin, "_get_client_ip")
+            else (request.remote or "")
+        )
+        logger.info(f"Token请求: content_type={content_type}, ip={client_ip}")
 
-        if "application/x-www-form-urlencoded" in content_type:
-            data = await request.post()
-        else:
-            data = await request.json()
+        try:
+            if "application/x-www-form-urlencoded" in content_type:
+                data = await request.post()
+            else:
+                data = await request.json()
+        except Exception as e:
+            logger.error(f"Token请求: 解析请求体失败: {e}")
+            return web.json_response(
+                {
+                    "error": "invalid_request",
+                    "error_description": "Failed to parse request body",
+                },
+                status=400,
+            )
 
         grant_type = data.get("grant_type", "")
         code = data.get("code", "")
         client_id = data.get("client_id", "")
         client_secret = data.get("client_secret", "")
+        redirect_uri = data.get("redirect_uri", "")
 
-        logger.info(f"Token请求: grant_type={grant_type}, client_id={client_id}")
+        logger.info(
+            f"Token请求: grant_type={grant_type}, client_id={client_id}, code={code[:8] if code else 'None'}..., redirect_uri={redirect_uri}"
+        )
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Basic "):
@@ -3010,9 +3137,8 @@ class WebHandler:
 
         if grant_type == "authorization_code":
             # 使用授权码换取 token
-            redirect_uri = data.get("redirect_uri", "")
-
             if not client_id:
+                logger.warning(f"Token请求: 缺少client_id")
                 return web.json_response(
                     {
                         "error": "invalid_client",
@@ -3022,6 +3148,7 @@ class WebHandler:
                 )
 
             if not self.client_manager.verify_client(client_id, client_secret):
+                logger.warning(f"Token请求: 客户端认证失败 client_id={client_id}")
                 return web.json_response(
                     {
                         "error": "invalid_client",
@@ -3030,12 +3157,31 @@ class WebHandler:
                     status=401,
                 )
 
+            if not code:
+                logger.warning(f"Token请求: 缺少授权码 client_id={client_id}")
+                return web.json_response(
+                    {"error": "invalid_request", "error_description": "missing code"},
+                    status=400,
+                )
+
+            logger.info(
+                f"Token请求: 交换授权码 client_id={client_id}, redirect_uri={redirect_uri}"
+            )
             token_data = await self.oidc_server.exchange_code(
                 code, client_id, redirect_uri
             )
 
             if not token_data:
-                return web.json_response({"error": "invalid_grant"}, status=400)
+                logger.warning(
+                    f"Token请求: 授权码无效或已过期 client_id={client_id}, code={code[:8]}..."
+                )
+                return web.json_response(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "Invalid or expired authorization code",
+                    },
+                    status=400,
+                )
 
             # 记录授权审计日志
             self.audit_log_manager.log(
@@ -3426,6 +3572,17 @@ class WebHandler:
         theme_color_css = escape_css_value(theme_color)
         favicon_url_safe = escape_html_attr(favicon_url)
 
+        # 获取自定义字体设置
+        custom_font_url = self._get_web_config("custom_font_url", "")
+        if custom_font_url:
+            custom_font_link = (
+                f'<link href="{escape_html_attr(custom_font_url)}" rel="stylesheet">'
+            )
+            custom_font_family = "'Custom Font', -apple-system, sans-serif"
+        else:
+            custom_font_link = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
+            custom_font_family = "'Inter', -apple-system, sans-serif"
+
         return rf"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -3434,7 +3591,7 @@ class WebHandler:
     <title>OIDC登录插件 - 管理后台</title>
     <link rel="icon" type="image/png" href="{favicon_url_safe}">
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    {custom_font_link}
     <script>
         tailwind.config = {{
             theme: {{
@@ -3447,17 +3604,22 @@ class WebHandler:
         }}
     </script>
     <style>
-        body {{ font-family: 'Inter', -apple-system, sans-serif; }}
+        body {{ font-family: {custom_font_family}; }}
         .glass {{ background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(12px); }}
         .tab-active {{ color: {theme_color_css}; border-bottom: 2px solid {theme_color_css}; }}
         .custom-scrollbar::-webkit-scrollbar {{ width: 6px; }}
         .custom-scrollbar::-webkit-scrollbar-track {{ background: transparent; }}
         .custom-scrollbar::-webkit-scrollbar-thumb {{ background: #e2e8f0; border-radius: 10px; }}
+        .scrollbar-hide::-webkit-scrollbar {{ display: none; }}
+        .scrollbar-hide {{ -ms-overflow-style: none; scrollbar-width: none; }}
         .bg-primary {{ background-color: {theme_color_css}; }}
         .text-primary {{ color: {theme_color_css}; }}
         .border-primary {{ border-color: {theme_color_css}; }}
         .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color_css}33; }}
         .hover\:bg-primary:hover {{ background-color: {theme_color_css}; }}
+        @media (max-width: 768px) {{
+            .mobile-scale {{ transform: scale(0.95); transform-origin: top center; }}
+        }}
     </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-indigo-50 via-slate-50 to-slate-50">
@@ -3481,40 +3643,45 @@ class WebHandler:
         </div>
     </nav>
 
-    <main class="max-w-6xl mx-auto px-6 py-8">
+    <main class="max-w-6xl mx-auto px-6 py-8 mobile-scale">
         {warning_html}
 
-        <div class="flex gap-8 mb-8 border-b border-slate-200">
-            <button class="tab px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all tab-active flex items-center gap-2" data-tab="info">
+        <div class="flex gap-4 md:gap-8 mb-8 border-b border-slate-200 overflow-x-auto whitespace-nowrap pb-1 scrollbar-hide">
+            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all tab-active flex items-center gap-2 whitespace-nowrap" data-tab="info">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                服务信息
+                <span class="hidden md:inline">服务信息</span>
+                <span class="md:hidden">信息</span>
             </button>
-            <button class="tab px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2" data-tab="config">
+            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="config">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                 </svg>
-                配置设置
+                <span class="hidden md:inline">配置设置</span>
+                <span class="md:hidden">配置</span>
             </button>
-            <button class="tab px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2" data-tab="sessions">
+            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="sessions">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
                 </svg>
-                认证会话
+                <span class="hidden md:inline">认证会话</span>
+                <span class="md:hidden">会话</span>
             </button>
-            <button class="tab px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2" data-tab="clients">
+            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="clients">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
                 </svg>
-                客户端管理
+                <span class="hidden md:inline">客户端管理</span>
+                <span class="md:hidden">客户端</span>
             </button>
-            <button class="tab px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2" data-tab="logs">
+            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="logs">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
-                审计日志
+                <span class="hidden md:inline">审计日志</span>
+                <span class="md:hidden">日志</span>
             </button>
         </div>
 
@@ -3586,16 +3753,134 @@ class WebHandler:
                             </div>
                             <div>
                                 <label class="block text-sm font-bold text-slate-700 mb-2">图标 URL</label>
-                                <input type="text" id="iconUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="图标图片URL，留空使用默认图标">
+                                <div class="flex gap-2">
+                                    <input type="text" id="iconUrl" class="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="图标图片URL，留空使用默认图标">
+                                    <input type="file" id="iconFile" class="hidden" accept="image/*">
+                                    <button onclick="document.getElementById('iconFile').click()" class="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-medium transition-all flex items-center gap-2">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                        </svg>
+                                        上传图片
+                                    </button>
+                                </div>
                                 <p class="text-xs text-slate-500 mt-2">用于后台页面和验证页面的图标，建议尺寸 64x64</p>
                             </div>
                             <div>
                                 <label class="block text-sm font-bold text-slate-700 mb-2">Favicon 图标 URL</label>
-                                <input type="text" id="faviconUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="Favicon图标URL，留空使用默认图标">
+                                <div class="flex gap-2">
+                                    <input type="text" id="faviconUrl" class="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="Favicon图标URL，留空使用默认图标">
+                                    <input type="file" id="faviconFile" class="hidden" accept="image/*">
+                                    <button onclick="document.getElementById('faviconFile').click()" class="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-medium transition-all flex items-center gap-2">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                        </svg>
+                                        上传图片
+                                    </button>
+                                </div>
                                 <p class="text-xs text-slate-500 mt-2">用于浏览器标签页图标，建议尺寸 32x32 或 64x64</p>
+                            </div>
+
+                            <!-- PC壁纸 -->
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="block text-sm font-bold text-slate-700 mb-2">PC 端背景图片</label>
+                                <div class="flex gap-2">
+                                    <input type="text" id="pcWallpaperUrl" class="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="图片 URL 或图床 API">
+                                    <input type="file" id="pcWallpaperFile" class="hidden" accept="image/*">
+                                    <button onclick="document.getElementById('pcWallpaperFile').click()" class="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-medium transition-all flex items-center gap-2">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                        </svg>
+                                        上传图片
+                                    </button>
+                                </div>
+                                <p class="text-xs text-slate-500 mt-2">支持 http 地址或图床 API，建议尺寸 1920x1080</p>
+                            </div>
+
+                            <!-- 手机壁纸 -->
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="block text-sm font-bold text-slate-700 mb-2">手机端背景图片</label>
+                                <div class="flex gap-2">
+                                    <input type="text" id="mobileWallpaperUrl" class="flex-1 px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="图片 URL 或图床 API">
+                                    <input type="file" id="mobileWallpaperFile" class="hidden" accept="image/*">
+                                    <button onclick="document.getElementById('mobileWallpaperFile').click()" class="px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-medium transition-all flex items-center gap-2">
+                                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                        </svg>
+                                        上传图片
+                                    </button>
+                                </div>
+                                <p class="text-xs text-slate-500 mt-2">支持 http 地址或图床 API，建议尺寸 1080x1920</p>
+                            </div>
+
+                            <!-- 字体设置 -->
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义字体 URL</label>
+                                <input type="text" id="customFontUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap">
+                                <p class="text-xs text-slate-500 mt-2">支持 Google Fonts 或其他 CDN 字体链接，留空使用系统默认字体</p>
+                            </div>
+
+                            <!-- CDN获取IP方式 -->
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="block text-sm font-bold text-slate-700 mb-2">CDN 获取 IP 方式</label>
+                                <select id="cdnIpMethod" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none">
+                                    <option value="">自动检测</option>
+                                    <option value="HTTP_X_FORWARDED_FOR">HTTP_X_FORWARDED_FOR</option>
+                                    <option value="HTTP_X_REAL_IP">HTTP_X_REAL_IP</option>
+                                    <option value="REMOTE_ADDR">REMOTE_ADDR</option>
+                                    <option value="HTTP_CLIENT_IP">HTTP_CLIENT_IP</option>
+                                    <option value="HTTP_X_FORWARDED">HTTP_X_FORWARDED</option>
+                                    <option value="HTTP_X_CLUSTER_CLIENT_IP">HTTP_X_CLUSTER_CLIENT_IP</option>
+                                    <option value="HTTP_FORWARDED_FOR">HTTP_FORWARDED_FOR</option>
+                                    <option value="HTTP_FORWARDED">HTTP_FORWARDED</option>
+                                    <option value="HTTP_CF_CONNECTING_IP">HTTP_CF_CONNECTING_IP (Cloudflare)</option>
+                                </select>
+                                <p class="text-xs text-slate-500 mt-2">根据您的 CDN 服务商选择合适的 IP 获取方式</p>
                             </div>
                         </div>
                     </div>
+                </div>
+                <div class="space-y-8">
+                    <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
+                        <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
+                            <span class="w-2 h-6 bg-amber-500 rounded-full"></span>
+                            默认验证方式
+                        </h2>
+                        <div class="space-y-6">
+                            <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                                <div>
+                                    <p class="text-sm font-bold text-slate-700">启用群聊验证</p>
+                                    <p class="text-xs text-slate-500">允许在指定群聊中接收验证码</p>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="enableGroupVerify" class="sr-only peer">
+                                    <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
+                                </label>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">接收验证码的群号</label>
+                                <input type="text" id="verifyGroupId" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="多个群号用英文逗号分隔">
+                            </div>
+                            <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                                <div>
+                                    <p class="text-sm font-bold text-slate-700">启用私聊验证</p>
+                                    <p class="text-xs text-slate-500">允许通过私聊机器人发送验证码</p>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="enablePrivateVerify" class="sr-only peer">
+                                    <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
+                                </label>
+                            </div>
+
+                            <!-- 自定义验证成功消息 -->
+                            <div class="pt-4 border-t border-slate-100">
+                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
+                                <textarea id="verifySuccessMessage" rows="3" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。"></textarea>
+                                <p class="text-xs text-slate-500 mt-2">用户验证成功后发送的自定义消息，留空使用默认消息</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 验证码设置 -->
                     <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
                         <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
                             <span class="w-2 h-6 bg-teal-500 rounded-full"></span>
@@ -3626,45 +3911,6 @@ class WebHandler:
                                 <input type="number" id="ipRateLimit" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" max="10000">
                                 <p class="text-xs text-slate-500 mt-2">每个IP每分钟最多请求次数，0为无限制，建议30-10000</p>
                             </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
-                    <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
-                        <span class="w-2 h-6 bg-amber-500 rounded-full"></span>
-                        验证方式设置
-                    </h2>
-                    <div class="space-y-6">
-                        <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                            <div>
-                                <p class="text-sm font-bold text-slate-700">启用群聊验证</p>
-                                <p class="text-xs text-slate-500">允许在指定群聊中接收验证码</p>
-                            </div>
-                            <label class="relative inline-flex items-center cursor-pointer">
-                                <input type="checkbox" id="enableGroupVerify" class="sr-only peer">
-                                <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
-                            </label>
-                        </div>
-                        <div>
-                            <label class="block text-sm font-bold text-slate-700 mb-2">接收验证码的群号</label>
-                            <input type="text" id="verifyGroupId" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="多个群号用英文逗号分隔">
-                        </div>
-                        <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                            <div>
-                                <p class="text-sm font-bold text-slate-700">启用私聊验证</p>
-                                <p class="text-xs text-slate-500">允许通过私聊机器人发送验证码</p>
-                            </div>
-                            <label class="relative inline-flex items-center cursor-pointer">
-                                <input type="checkbox" id="enablePrivateVerify" class="sr-only peer">
-                                <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
-                            </label>
-                        </div>
-
-                        <!-- 自定义验证成功消息 -->
-                        <div class="pt-4 border-t border-slate-100">
-                            <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
-                            <textarea id="verifySuccessMessage" rows="3" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。"></textarea>
-                            <p class="text-xs text-slate-500 mt-2">用户验证成功后发送的自定义消息，留空使用默认消息</p>
                         </div>
                     </div>
                 </div>
@@ -3733,36 +3979,81 @@ class WebHandler:
                             <input type="text" id="newClientIconUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="留空使用默认图标">
                             <p class="text-xs text-slate-500 mt-2">建议尺寸 64x64</p>
                         </div>
-                        <div class="md:col-span-2">
-                            <label class="block text-sm font-bold text-slate-700 mb-2">主页链接</label>
-                            <div id="homeUrlsContainer" class="space-y-2">
-                                <div class="flex items-center gap-2">
-                                    <input type="text" class="home-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com">
+
+                        <!-- 客户端验证方式设置 -->
+                        <div class="md:col-span-2 pt-4 border-t border-slate-100">
+                            <h3 class="text-sm font-bold text-slate-700 mb-4">验证方式设置</h3>
+                            <div class="grid md:grid-cols-2 gap-4">
+                                <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl">
+                                    <div>
+                                        <p class="text-sm font-bold text-slate-700">启用群聊验证</p>
+                                        <p class="text-xs text-slate-500">允许在指定群聊中接收验证码</p>
+                                    </div>
+                                    <label class="relative inline-flex items-center cursor-pointer">
+                                        <input type="checkbox" id="clientEnableGroupVerify" class="sr-only peer" checked>
+                                        <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
+                                    </label>
+                                </div>
+                                <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl">
+                                    <div>
+                                        <p class="text-sm font-bold text-slate-700">启用私聊验证</p>
+                                        <p class="text-xs text-slate-500">允许通过私聊机器人发送验证码</p>
+                                    </div>
+                                    <label class="relative inline-flex items-center cursor-pointer">
+                                        <input type="checkbox" id="clientEnablePrivateVerify" class="sr-only peer" checked>
+                                        <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
+                                    </label>
                                 </div>
                             </div>
-                            <button onclick="addHomeUrlInput()" class="mt-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-                                </svg>
-                                添加主页链接
-                            </button>
                         </div>
-                        <div class="md:col-span-2">
-                            <label class="block text-sm font-bold text-slate-700 mb-2">重定向 URL</label>
-                            <div id="redirectUrlsContainer" class="space-y-2">
-                                <div class="flex items-center gap-2">
-                                    <input type="text" class="redirect-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback">
-                                </div>
+
+                        <div class="grid md:grid-cols-2 gap-4 md:col-span-2">
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">接收验证码的群号</label>
+                                <input type="text" id="clientVerifyGroupId" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="多个群号用英文逗号分隔，留空使用全局设置">
+                                <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的群号</p>
                             </div>
-                            <button onclick="addRedirectUrlInput()" class="mt-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
+                                <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。留空使用全局设置"></textarea>
+                                <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证成功消息</p>
+                            </div>
+                        </div>
+
+                        <div class="grid md:grid-cols-2 gap-4 md:col-span-2">
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">主页链接</label>
+                                <div id="homeUrlsContainer" class="space-y-2">
+                                    <div class="flex items-center gap-2">
+                                        <input type="text" class="home-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com">
+                                    </div>
+                                </div>
+                                <button onclick="addHomeUrlInput()" class="mt-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                                    </svg>
+                                    添加主页链接
+                                </button>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">重定向 URL</label>
+                                <div id="redirectUrlsContainer" class="space-y-2">
+                                    <div class="flex items-center gap-2">
+                                        <input type="text" class="redirect-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback">
+                                    </div>
+                                </div>
+                                <button onclick="addRedirectUrlInput()" class="mt-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
                                 </svg>
                                 添加重定向 URL
                             </button>
                         </div>
                     </div>
-                    <div class="mt-6 flex justify-end gap-3">
+                </div>
+                <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100 mt-6">
+                    <div class="flex justify-center gap-3">
                         <button id="cancelEditBtn" onclick="resetClientForm()" class="hidden px-6 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-bold transition-all active:scale-[0.98]">
                             取消编辑
                         </button>
@@ -3888,6 +4179,11 @@ class WebHandler:
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
                 tab.classList.add('tab-active');
                 document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
+                // 切换到审计日志标签时重新加载日志
+                if (tab.dataset.tab === 'logs') {{
+                    console.log('切换到审计日志标签，重新加载...');
+                    loadLogs();
+                }}
             }});
         }});
 
@@ -3937,6 +4233,44 @@ class WebHandler:
                 document.getElementById('iconUrl').value = config.icon_url || '';
                 document.getElementById('faviconUrl').value = config.favicon_url || '';
 
+                // 外观设置
+                document.getElementById('customFontUrl').value = config.custom_font_url || '';
+                document.getElementById('pcWallpaperUrl').value = config.pc_wallpaper_url || '';
+                document.getElementById('mobileWallpaperUrl').value = config.mobile_wallpaper_url || '';
+
+                // 更新CDN IP方式下拉菜单，显示当前IP
+                const cdnIpSelect = document.getElementById('cdnIpMethod');
+                const ipHeaders = config.ip_headers || {{}};
+                const currentIp = config.current_ip || '';
+
+                // 清空现有选项
+                cdnIpSelect.innerHTML = '<option value="">自动检测' + (currentIp ? ' - ' + currentIp : '') + '</option>';
+
+                // 添加带IP信息的选项
+                const ipOptions = [
+                    {{ value: 'HTTP_X_FORWARDED_FOR', label: 'HTTP_X_FORWARDED_FOR' }},
+                    {{ value: 'HTTP_X_REAL_IP', label: 'HTTP_X_REAL_IP' }},
+                    {{ value: 'REMOTE_ADDR', label: 'REMOTE_ADDR' }},
+                    {{ value: 'HTTP_CLIENT_IP', label: 'HTTP_CLIENT_IP' }},
+                    {{ value: 'HTTP_X_FORWARDED', label: 'HTTP_X_FORWARDED' }},
+                    {{ value: 'HTTP_X_CLUSTER_CLIENT_IP', label: 'HTTP_X_CLUSTER_CLIENT_IP' }},
+                    {{ value: 'HTTP_FORWARDED_FOR', label: 'HTTP_FORWARDED_FOR' }},
+                    {{ value: 'HTTP_FORWARDED', label: 'HTTP_FORWARDED' }},
+                    {{ value: 'HTTP_CF_CONNECTING_IP', label: 'HTTP_CF_CONNECTING_IP (Cloudflare)' }}
+                ];
+
+                ipOptions.forEach(opt => {{
+                    const ipValue = ipHeaders[opt.value] || '';
+                    const displayText = ipValue ? opt.label + ' - ' + ipValue : opt.label + ' - 此模式不适用';
+                    const option = document.createElement('option');
+                    option.value = opt.value;
+                    option.textContent = displayText;
+                    if (opt.value === config.cdn_ip_method) {{
+                        option.selected = true;
+                    }}
+                    cdnIpSelect.appendChild(option);
+                }});
+
                 // 更新Favicon
                 if (config.favicon_url) {{
                     let favicon = document.querySelector('link[rel="icon"]');
@@ -3965,7 +4299,11 @@ class WebHandler:
                 verify_success_message: document.getElementById('verifySuccessMessage').value,
                 theme_color: document.getElementById('themeColor').value,
                 icon_url: document.getElementById('iconUrl').value,
-                favicon_url: document.getElementById('faviconUrl').value
+                favicon_url: document.getElementById('faviconUrl').value,
+                custom_font_url: document.getElementById('customFontUrl').value,
+                cdn_ip_method: document.getElementById('cdnIpMethod').value,
+                pc_wallpaper_url: document.getElementById('pcWallpaperUrl').value,
+                mobile_wallpaper_url: document.getElementById('mobileWallpaperUrl').value
             }};
 
             try {{
@@ -4120,7 +4458,7 @@ class WebHandler:
                         <td class="px-6 py-4 text-sm text-slate-400 font-medium">${{new Date(c.created_at * 1000).toLocaleString()}}</td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
+                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.enable_group_verify)}}, ${{JSON.stringify(c.enable_private_verify)}}, ${{JSON.stringify(c.verify_group_id || '')}}, ${{JSON.stringify(c.verify_success_message || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
                                 <button onclick="deleteClient(${{JSON.stringify(c.client_id)}})" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
                             </div>
                         </td>
@@ -4201,12 +4539,16 @@ class WebHandler:
             document.getElementById('cancelEditBtn').classList.add('hidden');
         }}
 
-        function editClient(clientId, name, clientSecret, iconUrl, homeUrls, redirectUrls) {{
+        function editClient(clientId, name, clientSecret, iconUrl, enableGroupVerify, enablePrivateVerify, verifyGroupId, verifySuccessMessage, homeUrls, redirectUrls) {{
             editingClientId = clientId;
             document.getElementById('newClientName').value = name || '';
             document.getElementById('newClientId').value = clientId || '';
             document.getElementById('newClientSecret').value = clientSecret || '';
             document.getElementById('newClientIconUrl').value = iconUrl || '';
+            document.getElementById('clientEnableGroupVerify').checked = enableGroupVerify !== false;
+            document.getElementById('clientEnablePrivateVerify').checked = enablePrivateVerify !== false;
+            document.getElementById('clientVerifyGroupId').value = verifyGroupId || '';
+            document.getElementById('clientVerifySuccessMessage').value = verifySuccessMessage || '';
 
             // 设置主页链接
             const homeUrlsContainer = document.getElementById('homeUrlsContainer');
@@ -4238,6 +4580,10 @@ class WebHandler:
             const client_id = document.getElementById('newClientId').value;
             const client_secret = document.getElementById('newClientSecret').value;
             const icon_url = document.getElementById('newClientIconUrl').value;
+            const enable_group_verify = document.getElementById('clientEnableGroupVerify').checked;
+            const enable_private_verify = document.getElementById('clientEnablePrivateVerify').checked;
+            const verify_group_id = document.getElementById('clientVerifyGroupId').value;
+            const verify_success_message = document.getElementById('clientVerifySuccessMessage').value;
             const home_urls = getHomeUrls();
             const redirect_urls = getRedirectUrls();
 
@@ -4267,6 +4613,10 @@ class WebHandler:
                         client_id: client_id,
                         client_secret: client_secret,
                         icon_url: icon_url,
+                        enable_group_verify: enable_group_verify,
+                        enable_private_verify: enable_private_verify,
+                        verify_group_id: verify_group_id,
+                        verify_success_message: verify_success_message,
                         home_urls: home_urls,
                         redirect_urls: redirect_urls
                     }})
@@ -4347,13 +4697,19 @@ class WebHandler:
 
         async function loadLogs() {{
             try {{
-                const response = await fetch(basePath + `api/logs?limit=${{logsPerPage}}&offset=${{currentLogPage * logsPerPage}}&action=${{currentLogFilter}}`, {{
+                console.log('开始加载审计日志...');
+                const response = await fetch(basePath + 'api/logs?limit=' + logsPerPage + '&offset=' + (currentLogPage * logsPerPage) + '&action=' + currentLogFilter, {{
                     headers: {{ 'Authorization': 'Bearer ' + token }}
                 }});
                 const data = await response.json();
-                if (!data.success) return;
+                console.log('审计日志响应:', data);
+                if (!data.success) {{
+                    console.error('加载日志失败:', data.message);
+                    document.getElementById('logTable').innerHTML = '<tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">加载失败: ' + escapeHtml(data.message || '未知错误') + '</td></tr>';
+                    return;
+                }}
 
-                document.getElementById('logCount').textContent = `共 ${{data.total}} 条日志`;
+                document.getElementById('logCount').textContent = '共 ' + data.total + ' 条日志';
                 const tbody = document.getElementById('logTable');
                 if (data.logs.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">暂无日志</td></tr>';
@@ -4372,24 +4728,20 @@ class WebHandler:
 
                     tbody.innerHTML = data.logs.map(log => {{
                         const action = actionLabels[log.action] || {{ text: escapeHtml(log.action), class: 'bg-slate-100 text-slate-600' }};
-                        return `
-                            <tr class="hover:bg-slate-50/50 transition-colors">
-                                <td class="px-3 py-4 text-sm text-slate-600">${{new Date(log.timestamp * 1000).toLocaleString()}}</td>
-                                <td class="px-3 py-4">
-                                    <span class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ${{action.class}}">${{action.text}}</span>
-                                </td>
-                                <td class="px-3 py-4 text-sm text-slate-600">${{escapeHtml(log.details) || '-'}}</td>
-                                <td class="px-3 py-4 text-sm text-slate-600">${{escapeHtml(log.user) || '-'}}</td>
-                                <td class="px-3 py-4 text-sm text-slate-600 font-mono">${{escapeHtml(log.ip) || '-'}}</td>
-                            </tr>
-                        `;
+                        return '<tr class="hover:bg-slate-50/50 transition-colors">' +
+                            '<td class="px-3 py-4 text-sm text-slate-600">' + new Date(log.timestamp * 1000).toLocaleString() + '</td>' +
+                            '<td class="px-3 py-4"><span class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ' + action.class + '">' + action.text + '</span></td>' +
+                            '<td class="px-3 py-4 text-sm text-slate-600">' + (escapeHtml(log.details) || '-') + '</td>' +
+                            '<td class="px-3 py-4 text-sm text-slate-600">' + (escapeHtml(log.user) || '-') + '</td>' +
+                            '<td class="px-3 py-4 text-sm text-slate-600 font-mono">' + (escapeHtml(log.ip) || '-') + '</td>' +
+                        '</tr>';
                     }}).join('');
                 }}
 
                 // 更新分页按钮状态
                 document.getElementById('prevLogPage').disabled = currentLogPage === 0;
                 document.getElementById('nextLogPage').disabled = (currentLogPage + 1) * logsPerPage >= data.total;
-                document.getElementById('logPageInfo').textContent = `第 ${{currentLogPage + 1}} 页`;
+                document.getElementById('logPageInfo').textContent = '第 ' + (currentLogPage + 1) + ' 页';
             }} catch (err) {{
                 console.error('加载日志失败:', err);
             }}
@@ -4464,6 +4816,18 @@ class WebHandler:
         )
         poll_interval = self._get_web_config("poll_interval", 1)
         poll_interval_ms = max(1000, min(30000, poll_interval * 1000))
+
+        # 获取自定义字体设置
+        custom_font_url = self._get_web_config("custom_font_url", "")
+        if custom_font_url:
+            custom_font_link = (
+                f'<link href="{escape_html_attr(custom_font_url)}" rel="stylesheet">'
+            )
+            # 从URL中提取字体名称（简化处理）
+            custom_font_family = "'Custom Font', -apple-system, sans-serif"
+        else:
+            custom_font_link = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
+            custom_font_family = "'Inter', -apple-system, sans-serif"
 
         client_name = client.get("name", "未知应用") if client else "未知应用"
 
@@ -4567,6 +4931,8 @@ class WebHandler:
                 group_info=group_info,
                 private_info=private_info,
                 poll_interval_ms=poll_interval_ms,
+                custom_font_link=custom_font_link,
+                custom_font_family=custom_font_family,
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}，使用内置模板")
@@ -4630,6 +4996,8 @@ class WebHandler:
                 group_info=group_info,
                 private_info=private_info,
                 poll_interval_ms=poll_interval_ms,
+                custom_font_link=custom_font_link,
+                custom_font_family=custom_font_family,
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}")
@@ -4845,6 +5213,42 @@ class ChuyeOIDCPlugin(Star):
         if hasattr(self, "config_manager") and self.config_manager:
             return self.config_manager.get(key, default)
         return default
+
+    def _get_client_ip(self, request: web.Request) -> str:
+        """获取客户端真实IP地址
+
+        根据配置的CDN IP获取方式，从请求头中提取客户端真实IP。
+        支持多种CDN服务商的IP获取方式。
+        """
+        cdn_ip_method = self._get_web_config("cdn_ip_method", "")
+
+        # 如果配置了特定的CDN IP获取方式
+        if cdn_ip_method:
+            header_value = request.headers.get(cdn_ip_method, "")
+            if header_value:
+                # 处理可能包含多个IP的情况（如 X-Forwarded-For: client, proxy1, proxy2）
+                ips = [ip.strip() for ip in header_value.split(",")]
+                return ips[0] if ips else request.remote or ""
+
+        # 自动检测：按优先级尝试各种方式
+        ip_headers = [
+            "HTTP_CF_CONNECTING_IP",  # Cloudflare
+            "HTTP_X_FORWARDED_FOR",  # 常见CDN/代理
+            "HTTP_X_REAL_IP",  # Nginx代理
+            "HTTP_CLIENT_IP",  # 一些代理
+            "HTTP_X_FORWARDED",  # 一些代理
+            "HTTP_X_CLUSTER_CLIENT_IP",  # 一些负载均衡
+            "HTTP_FORWARDED_FOR",  # 标准Forwarded头
+            "HTTP_FORWARDED",  # 标准Forwarded头
+        ]
+
+        for header in ip_headers:
+            header_value = request.headers.get(header, "")
+            if header_value:
+                ips = [ip.strip() for ip in header_value.split(",")]
+                return ips[0] if ips else ""
+
+        return request.remote or ""
 
     async def initialize(self):
         logger.info("OIDC登录插件正在初始化...")
