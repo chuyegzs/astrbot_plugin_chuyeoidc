@@ -292,183 +292,6 @@ class VerifyCode:
     used: bool = False
 
 
-class AuditLogManager:
-    """审计日志管理器
-
-    记录关键操作日志，包括登录、授权、客户端管理等操作。
-    数据存储在 AstrBot data 目录下，支持在管理后台查看。
-
-    性能优化特性：
-    - 按操作类型建立索引，加速过滤查询
-    - 批量保存机制，减少磁盘I/O
-    - 内存缓存，避免重复遍历
-    """
-
-    def __init__(self, data_dir: str):
-        self.logs_file = os.path.join(data_dir, "audit_logs.json")
-        self._logs: list = []
-        self._max_logs = 1000  # 最多保留1000条日志
-        self._action_index: dict[str, list] = {}  # 操作类型索引
-        self._pending_logs: list = []  # 待保存的日志
-        self._save_interval = 10  # 批量保存间隔（条）
-        self._lock = asyncio.Lock()
-        self._load_logs()
-        self._rebuild_index()
-
-    def _load_logs(self):
-        """加载现有日志"""
-        if os.path.exists(self.logs_file):
-            try:
-                with open(self.logs_file, encoding="utf-8") as f:
-                    self._logs = json.load(f)
-            except Exception as e:
-                logger.error(f"加载审计日志失败: {e}")
-                self._logs = []
-        else:
-            self._logs = []
-
-    def _save_logs(self):
-        """保存日志到文件"""
-        try:
-            with open(self.logs_file, "w", encoding="utf-8") as f:
-                json.dump(self._logs, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.error(f"保存审计日志失败: {e}")
-
-    def _rebuild_index(self):
-        """重建操作类型索引"""
-        self._action_index = {}
-        for i, log in enumerate(self._logs):
-            action = log.get("action")
-            if action:
-                if action not in self._action_index:
-                    self._action_index[action] = []
-                self._action_index[action].append(i)
-
-    def _add_to_index(self, log_entry: dict, index: int):
-        """添加日志到索引"""
-        action = log_entry.get("action")
-        if action:
-            if action not in self._action_index:
-                self._action_index[action] = []
-            self._action_index[action].append(index)
-
-    async def _flush_pending_logs(self):
-        """批量保存待处理的日志"""
-        async with self._lock:
-            if not self._pending_logs:
-                return
-
-            # 将待处理日志添加到主日志列表
-            for log_entry in self._pending_logs:
-                self._logs.insert(0, log_entry)
-
-            # 重建索引（因为使用了 insert(0)，所有索引位置都变了）
-            self._rebuild_index()
-
-            # 限制日志数量
-            if len(self._logs) > self._max_logs:
-                self._logs = self._logs[: self._max_logs]
-                self._rebuild_index()
-
-            # 保存到文件
-            self._save_logs()
-
-            # 清空待处理列表
-            count = len(self._pending_logs)
-            self._pending_logs = []
-            logger.debug(f"批量保存了 {count} 条审计日志")
-
-    def log(self, action: str, details: str = "", user: str = "", ip: str = ""):
-        """记录一条审计日志
-
-        Args:
-            action: 操作类型，如 LOGIN, LOGOUT, CLIENT_ADD, CLIENT_UPDATE, CLIENT_DELETE, CONFIG_UPDATE, AUTHORIZE, TOKEN_EXCHANGE
-            details: 操作详情
-            user: 操作用户
-            ip: 操作者IP地址
-        """
-        # 对敏感信息进行脱敏处理
-        sanitized_details = LogSanitizer.sanitize(details)
-        sanitized_user = LogSanitizer.sanitize(user)
-
-        log_entry = {
-            "timestamp": time.time(),
-            "datetime": datetime.now(timezone.utc).isoformat(),
-            "action": action,
-            "details": sanitized_details,
-            "user": sanitized_user,
-            "ip": ip,
-        }
-
-        # 添加到待处理列表
-        self._pending_logs.append(log_entry)
-
-        # 达到批量保存阈值时立即保存
-        if len(self._pending_logs) >= self._save_interval:
-            # 使用 create_task 异步执行保存
-            try:
-                asyncio.create_task(self._flush_pending_logs())
-            except RuntimeError:
-                # 如果没有事件循环，同步保存所有待处理日志
-                for pending_entry in self._pending_logs:
-                    self._logs.insert(0, pending_entry)
-                    self._add_to_index(pending_entry, 0)
-                if len(self._logs) > self._max_logs:
-                    self._logs = self._logs[: self._max_logs]
-                    self._rebuild_index()
-                self._save_logs()
-                self._pending_logs = []
-
-    async def flush(self):
-        """强制保存所有待处理的日志"""
-        await self._flush_pending_logs()
-
-    def get_logs(
-        self, limit: int = 100, offset: int = 0, action_filter: str = None
-    ) -> list:
-        """获取日志列表
-
-        Args:
-            limit: 返回的最大条数
-            offset: 跳过前多少条
-            action_filter: 按操作类型过滤
-
-        Returns:
-            日志列表（使用索引加速过滤）
-        """
-        # 先刷新待处理日志
-        if self._pending_logs:
-            try:
-                asyncio.create_task(self._flush_pending_logs())
-            except RuntimeError:
-                pass
-
-        if action_filter and action_filter in self._action_index:
-            # 使用索引快速获取指定类型的日志
-            indices = self._action_index[action_filter]
-            filtered_logs = [self._logs[i] for i in indices]
-            return filtered_logs[offset : offset + limit]
-        elif action_filter:
-            # 索引中没有该类型，返回空列表
-            return []
-        else:
-            # 返回所有日志
-            return self._logs[offset : offset + limit]
-
-    def get_logs_count(self, action_filter: str = None) -> int:
-        """获取日志总数（使用索引加速）"""
-        if action_filter:
-            return len(self._action_index.get(action_filter, []))
-        return len(self._logs) + len(self._pending_logs)
-
-    def clear_logs(self):
-        """清空所有日志"""
-        self._logs = []
-        self._pending_logs = []
-        self._action_index = {}
-        self._save_logs()
-
 
 class KeyManager:
     """密钥管理器
@@ -1474,6 +1297,7 @@ class OIDCServer:
                     "session_id": session_id,
                     "created_at": time.time(),
                     "used": False,
+                    "client_id": client_id,
                 },
             )
             logger.info(
@@ -2038,24 +1862,16 @@ class WebHandler:
         oidc_server: OIDCServer,
         config_manager: ConfigManager,
         client_manager: ClientManager,
-        audit_log_manager: AuditLogManager,
     ):
         self.plugin = plugin
         self.oidc_server = oidc_server
         self.config_manager = config_manager
         self.client_manager = client_manager
-        self.audit_log_manager = audit_log_manager
         self.sessions: dict[str, dict] = {}
         self._lock = asyncio.Lock()  # 用于保护会话操作
 
         # 速率限制告警回调函数
         async def on_rate_limit_triggered(identifier: str, ip: str, attempts: int):
-            self.audit_log_manager.log(
-                action="RATE_LIMIT_TRIGGERED",
-                details=f"触发速率限制: {attempts} 次失败尝试",
-                user=identifier,
-                ip=ip,
-            )
             logger.warning(
                 f"速率限制触发: 用户={identifier}, IP={ip}, 尝试次数={attempts}"
             )
@@ -2072,12 +1888,6 @@ class WebHandler:
         async def on_verify_rate_limit_triggered(
             identifier: str, ip: str, attempts: int
         ):
-            self.audit_log_manager.log(
-                action="VERIFY_RATE_LIMITED",
-                details=f"验证码验证速率限制触发: {attempts} 次尝试",
-                user=identifier,
-                ip=ip,
-            )
             logger.warning(f"验证码验证速率限制触发: IP={ip}, 尝试次数={attempts}")
 
         # 从配置读取IP速率限制，默认60次/分钟
@@ -2149,10 +1959,11 @@ class WebHandler:
             if not session:
                 return False
             created_at = session.get("created_at", 0)
-            if time.time() - created_at > self.SESSION_EXPIRE_SECONDS:
+            current_time = time.time()
+            elapsed = current_time - created_at
+            if elapsed > self.SESSION_EXPIRE_SECONDS:
                 # Session 已过期，删除
                 self.sessions.pop(token, None)  # 使用 pop 避免 KeyError
-                logger.info(f"Session 已过期并删除: {token[:10]}...")
                 return False
             return True
 
@@ -2304,8 +2115,6 @@ class WebHandler:
                 f"{secure_path}/api/clients/add": self.handle_api_clients_add,
                 f"{secure_path}/api/clients/update": self.handle_api_clients_update,
                 f"{secure_path}/api/clients/delete": self.handle_api_clients_delete,
-                f"{secure_path}/api/logs": self.handle_api_logs,
-                f"{secure_path}/api/logs/clear": self.handle_api_logs_clear,
                 "authorize": self.handle_authorize,
                 "token": self.handle_token,
                 "userinfo": self.handle_userinfo,
@@ -2371,24 +2180,12 @@ class WebHandler:
                 username, ip
             )
             if not allowed:
-                self.audit_log_manager.log(
-                    action="LOGIN_RATE_LIMITED",
-                    details=error_msg,
-                    user=username,
-                    ip=ip,
-                )
                 return web.json_response(
                     {"success": False, "message": error_msg},
                     status=429,  # Too Many Requests
                 )
 
             if self._check_password_default():
-                self.audit_log_manager.log(
-                    action="LOGIN_FAILED",
-                    details="尝试使用默认密码登录",
-                    user=username,
-                    ip=ip,
-                )
                 return web.json_response(
                     {
                         "success": False,
@@ -2403,12 +2200,6 @@ class WebHandler:
                 await self.rate_limiter.reset_attempts(username, ip)
                 token = self._generate_session_token()
                 self.sessions[token] = {"username": username, "created_at": time.time()}
-                self.audit_log_manager.log(
-                    action="LOGIN",
-                    details="管理后台登录成功",
-                    user=username,
-                    ip=ip,
-                )
                 return web.json_response({"success": True, "token": token})
             else:
                 # 登录失败，获取剩余尝试次数
@@ -2417,12 +2208,6 @@ class WebHandler:
                     0, attempts_info["max_attempts"] - attempts_info["attempts_count"]
                 )
 
-                self.audit_log_manager.log(
-                    action="LOGIN_FAILED",
-                    details=f"用户名或密码错误，剩余尝试次数: {remaining}",
-                    user=username,
-                    ip=ip,
-                )
                 error_message = "用户名或密码错误"
                 if remaining > 0:
                     error_message += f"，还剩 {remaining} 次尝试机会"
@@ -2642,14 +2427,6 @@ class WebHandler:
                         )
                     logger.info(f"IP速率限制已更新为: {ip_rate_limit}")
 
-                # 记录配置更新审计日志
-                username = self.sessions.get(token, {}).get("username", "unknown")
-                self.audit_log_manager.log(
-                    action="CONFIG_UPDATE",
-                    details=f"更新配置: {list(update_data.keys())}",
-                    user=username,
-                    ip=request.remote or "",
-                )
                 return web.json_response({"success": True, "message": "配置保存成功"})
             else:
                 logger.error("配置保存失败")
@@ -2793,14 +2570,6 @@ class WebHandler:
                 verify_group_id,
                 verify_success_message,
             ):
-                # 记录客户端创建审计日志
-                username = self.sessions.get(token, {}).get("username", "unknown")
-                self.audit_log_manager.log(
-                    action="CLIENT_ADD",
-                    details=f"创建客户端: {name} ({client_id})",
-                    user=username,
-                    ip=request.remote or "",
-                )
                 return web.json_response(
                     {
                         "success": True,
@@ -2872,14 +2641,6 @@ class WebHandler:
                 verify_group_id,
                 verify_success_message,
             ):
-                # 记录客户端更新审计日志
-                username = self.sessions.get(token, {}).get("username", "unknown")
-                self.audit_log_manager.log(
-                    action="CLIENT_UPDATE",
-                    details=f"更新客户端: {name} ({client_id})",
-                    user=username,
-                    ip=request.remote or "",
-                )
                 return web.json_response(
                     {
                         "success": True,
@@ -2920,14 +2681,6 @@ class WebHandler:
                 )
 
             if self.client_manager.delete_client(client_id):
-                # 记录客户端删除审计日志
-                username = self.sessions.get(token, {}).get("username", "unknown")
-                self.audit_log_manager.log(
-                    action="CLIENT_DELETE",
-                    details=f"删除客户端: {client_id}",
-                    user=username,
-                    ip=request.remote or "",
-                )
                 return web.json_response({"success": True, "message": "客户端删除成功"})
             else:
                 return web.json_response(
@@ -2935,74 +2688,6 @@ class WebHandler:
                 )
         except Exception as e:
             logger.error(f"删除客户端错误: {e}")
-            return web.json_response(
-                {"success": False, "message": "服务器错误"}, status=500
-            )
-
-    async def handle_api_logs(self, request: web.Request) -> web.Response:
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not await self._validate_session(token):
-            return web.json_response(
-                {"success": False, "message": "未授权或会话已过期"}, status=401
-            )
-
-        try:
-            limit = min(
-                int(request.query.get("limit", 100)), 1000
-            )  # 限制最大1000，防止DoS
-            offset = max(0, int(request.query.get("offset", 0)))  # 确保非负
-            action_filter = request.query.get("action", None)
-
-            logger.info(
-                f"获取审计日志: limit={limit}, offset={offset}, action_filter={action_filter}"
-            )
-
-            if not self.audit_log_manager:
-                logger.error("审计日志管理器未初始化")
-                return web.json_response(
-                    {"success": False, "message": "审计日志管理器未初始化"}, status=500
-                )
-
-            logs = self.audit_log_manager.get_logs(limit, offset, action_filter)
-            total = self.audit_log_manager.get_logs_count(action_filter)
-
-            logger.info(f"审计日志查询结果: total={total}, logs_count={len(logs)}")
-
-            return web.json_response(
-                {
-                    "success": True,
-                    "logs": logs,
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset,
-                }
-            )
-        except Exception as e:
-            logger.error(f"获取审计日志错误: {e}")
-            return web.json_response(
-                {"success": False, "message": f"服务器错误: {str(e)}"}, status=500
-            )
-
-    async def handle_api_logs_clear(self, request: web.Request) -> web.Response:
-        token = request.headers.get("Authorization", "").replace("Bearer ", "")
-        if not await self._validate_session(token):
-            return web.json_response(
-                {"success": False, "message": "未授权或会话已过期"}, status=401
-            )
-
-        try:
-            self.audit_log_manager.clear_logs()
-            # 记录清空日志操作
-            username = self.sessions.get(token, {}).get("username", "unknown")
-            self.audit_log_manager.log(
-                action="CLEAR_LOGS",
-                details="清空审计日志",
-                user=username,
-                ip=request.remote or "",
-            )
-            return web.json_response({"success": True, "message": "日志已清空"})
-        except Exception as e:
-            logger.error(f"清空审计日志错误: {e}")
             return web.json_response(
                 {"success": False, "message": "服务器错误"}, status=500
             )
@@ -3183,14 +2868,6 @@ class WebHandler:
                     status=400,
                 )
 
-            # 记录授权审计日志
-            self.audit_log_manager.log(
-                action="TOKEN_EXCHANGE",
-                details=f"授权码换取Token: client_id={client_id}",
-                user="",
-                ip=request.remote or "",
-            )
-
             response = web.json_response(token_data)
             self._set_cors_headers(response, request)
             response.headers["Cache-Control"] = (
@@ -3233,14 +2910,6 @@ class WebHandler:
                     },
                     status=400,
                 )
-
-            # 记录刷新 token 审计日志
-            self.audit_log_manager.log(
-                action="TOKEN_REFRESH",
-                details=f"刷新Token: client_id={client_id}",
-                user="",
-                ip=request.remote or "",
-            )
 
             response = web.json_response(token_data)
             self._set_cors_headers(response, request)
@@ -3617,6 +3286,7 @@ class WebHandler:
         .border-primary {{ border-color: {theme_color_css}; }}
         .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color_css}33; }}
         .hover\:bg-primary:hover {{ background-color: {theme_color_css}; }}
+        .tab-content {{ display: none; }}
         @media (max-width: 768px) {{
             .mobile-scale {{ transform: scale(0.95); transform-origin: top center; }}
         }}
@@ -3676,16 +3346,9 @@ class WebHandler:
                 <span class="hidden md:inline">客户端管理</span>
                 <span class="md:hidden">客户端</span>
             </button>
-            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="logs">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-                <span class="hidden md:inline">审计日志</span>
-                <span class="md:hidden">日志</span>
-            </button>
         </div>
 
-        <div id="tab-info" class="tab-content space-y-8">
+        <div id="tab-info" class="tab-content space-y-8" style="display: block;">
             <div class="grid md:grid-cols-2 gap-8">
                 <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
                     <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
@@ -3734,7 +3397,7 @@ class WebHandler:
             </div>
         </div>
 
-        <div id="tab-config" class="tab-content hidden space-y-8">
+        <div id="tab-config" class="tab-content space-y-8" style="display: none;">
             <div class="grid md:grid-cols-2 gap-8">
                 <div class="space-y-8">
                     <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
@@ -3925,7 +3588,7 @@ class WebHandler:
             </div>
         </div>
 
-        <div id="tab-sessions" class="tab-content hidden">
+        <div id="tab-sessions" class="tab-content" style="display: none;">
             <div class="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
                 <div class="p-8 border-b border-slate-100 flex items-center justify-between">
                     <h2 class="text-lg font-bold flex items-center gap-2">
@@ -3952,7 +3615,7 @@ class WebHandler:
             </div>
         </div>
 
-        <div id="tab-clients" class="tab-content hidden">
+        <div id="tab-clients" class="tab-content" style="display: none;">
             <div class="space-y-8">
                 <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
                     <div class="flex items-center justify-between mb-6">
@@ -4052,7 +3715,7 @@ class WebHandler:
                         </div>
                     </div>
                 </div>
-                <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100 mt-6">
+                <div class="mt-6">
                     <div class="flex justify-center gap-3">
                         <button id="cancelEditBtn" onclick="resetClientForm()" class="hidden px-6 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-2xl font-bold transition-all active:scale-[0.98]">
                             取消编辑
@@ -4095,69 +3758,6 @@ class WebHandler:
                 </div>
             </div>
         </div>
-
-        <div id="tab-logs" class="tab-content hidden">
-            <div class="space-y-8">
-                <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
-                    <div class="flex items-center justify-between mb-6">
-                        <h2 class="text-lg font-bold flex items-center gap-2">
-                            <span class="w-2 h-6 bg-primary rounded-full"></span>
-                            审计日志
-                        </h2>
-                        <div class="flex items-center gap-3">
-                            <select id="logFilter" class="px-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-sm font-medium focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none">
-                                <option value="">全部类型</option>
-                                <option value="LOGIN">登录</option>
-                                <option value="LOGOUT">登出</option>
-                                <option value="CLIENT_ADD">添加客户端</option>
-                                <option value="CLIENT_UPDATE">更新客户端</option>
-                                <option value="CLIENT_DELETE">删除客户端</option>
-                                <option value="CONFIG_UPDATE">配置更新</option>
-                                <option value="AUTHORIZE">授权</option>
-                                <option value="TOKEN_EXCHANGE">令牌交换</option>
-                                <option value="CLEAR_LOGS">清空日志</option>
-                            </select>
-                            <button onclick="clearLogs()" class="px-4 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                </svg>
-                                清空日志
-                            </button>
-                        </div>
-                    </div>
-                    <div class="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
-                        <div class="overflow-x-auto custom-scrollbar max-h-[500px]">
-                            <table class="w-full text-left border-collapse">
-                                <thead class="sticky top-0 bg-white z-10">
-                                    <tr class="bg-slate-50/50 border-b border-slate-100">
-                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-28">时间</th>
-                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-36">操作类型</th>
-                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider">详情</th>
-                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-20">用户</th>
-                                        <th class="px-3 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider w-28">IP地址</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="logTable" class="divide-y divide-slate-100">
-                                    <tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">加载中...</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                    <div class="flex items-center justify-between mt-6">
-                        <span class="text-sm text-slate-500" id="logCount">共 0 条日志</span>
-                        <div class="flex items-center gap-2">
-                            <button onclick="changeLogPage(-1)" id="prevLogPage" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed">
-                                上一页
-                            </button>
-                            <span class="text-sm text-slate-600 font-medium" id="logPageInfo">第 1 页</span>
-                            <button onclick="changeLogPage(1)" id="nextLogPage" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-sm font-bold transition-all disabled:opacity-50 disabled:cursor-not-allowed">
-                                下一页
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
     </main>
 
     <footer class="border-t border-slate-200 mt-12 py-6 text-center">
@@ -4169,20 +3769,30 @@ class WebHandler:
     <div id="toast" class="fixed bottom-8 right-8 px-6 py-4 rounded-2xl shadow-2xl transform translate-y-20 opacity-0 transition-all duration-300 z-[100] flex items-center gap-3 font-bold text-white"></div>
 
     <script>
+        // 全局错误处理
+        window.onerror = function(msg, url, line, col, error) {{
+            console.error('JavaScript错误:', msg, 'URL:', url, '行:', line, '列:', col, '错误:', error);
+        }};
+
         const token = localStorage.getItem('token');
         const basePath = window.location.pathname.endsWith('/') ? window.location.pathname : window.location.pathname + '/';
+        console.log('页面初始化, basePath:', basePath);
         if (!token) {{ window.location.href = basePath + 'login'; }}
 
         document.querySelectorAll('.tab').forEach(tab => {{
             tab.addEventListener('click', () => {{
+                console.log('点击标签:', tab.dataset.tab);
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('tab-active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+                document.querySelectorAll('.tab-content').forEach(c => {{
+                    c.style.display = 'none';
+                }});
                 tab.classList.add('tab-active');
-                document.getElementById('tab-' + tab.dataset.tab).classList.remove('hidden');
-                // 切换到审计日志标签时重新加载日志
-                if (tab.dataset.tab === 'logs') {{
-                    console.log('切换到审计日志标签，重新加载...');
-                    loadLogs();
+                const tabContent = document.getElementById('tab-' + tab.dataset.tab);
+                if (tabContent) {{
+                    tabContent.style.display = 'block';
+                    console.log('显示标签内容:', tab.dataset.tab);
+                }} else {{
+                    console.error('找不到标签内容:', 'tab-' + tab.dataset.tab);
                 }}
             }});
         }});
@@ -4248,24 +3858,24 @@ class WebHandler:
 
                 // 添加带IP信息的选项
                 const ipOptions = [
-                    {{ value: 'HTTP_X_FORWARDED_FOR', label: 'HTTP_X_FORWARDED_FOR' }},
-                    {{ value: 'HTTP_X_REAL_IP', label: 'HTTP_X_REAL_IP' }},
-                    {{ value: 'REMOTE_ADDR', label: 'REMOTE_ADDR' }},
-                    {{ value: 'HTTP_CLIENT_IP', label: 'HTTP_CLIENT_IP' }},
-                    {{ value: 'HTTP_X_FORWARDED', label: 'HTTP_X_FORWARDED' }},
-                    {{ value: 'HTTP_X_CLUSTER_CLIENT_IP', label: 'HTTP_X_CLUSTER_CLIENT_IP' }},
-                    {{ value: 'HTTP_FORWARDED_FOR', label: 'HTTP_FORWARDED_FOR' }},
-                    {{ value: 'HTTP_FORWARDED', label: 'HTTP_FORWARDED' }},
-                    {{ value: 'HTTP_CF_CONNECTING_IP', label: 'HTTP_CF_CONNECTING_IP (Cloudflare)' }}
+                    {{ 'value': 'HTTP_X_FORWARDED_FOR', 'label': 'HTTP_X_FORWARDED_FOR' }},
+                    {{ 'value': 'HTTP_X_REAL_IP', 'label': 'HTTP_X_REAL_IP' }},
+                    {{ 'value': 'REMOTE_ADDR', 'label': 'REMOTE_ADDR' }},
+                    {{ 'value': 'HTTP_CLIENT_IP', 'label': 'HTTP_CLIENT_IP' }},
+                    {{ 'value': 'HTTP_X_FORWARDED', 'label': 'HTTP_X_FORWARDED' }},
+                    {{ 'value': 'HTTP_X_CLUSTER_CLIENT_IP', 'label': 'HTTP_X_CLUSTER_CLIENT_IP' }},
+                    {{ 'value': 'HTTP_FORWARDED_FOR', 'label': 'HTTP_FORWARDED_FOR' }},
+                    {{ 'value': 'HTTP_FORWARDED', 'label': 'HTTP_FORWARDED' }},
+                    {{ 'value': 'HTTP_CF_CONNECTING_IP', 'label': 'HTTP_CF_CONNECTING_IP (Cloudflare)' }}
                 ];
 
-                ipOptions.forEach(opt => {{
-                    const ipValue = ipHeaders[opt.value] || '';
-                    const displayText = ipValue ? opt.label + ' - ' + ipValue : opt.label + ' - 此模式不适用';
+                ipOptions.forEach(function(opt) {{
+                    const ipValue = ipHeaders[opt['value']] || '';
+                    const displayText = ipValue ? opt['label'] + ' - ' + ipValue : opt['label'] + ' - 此模式不适用';
                     const option = document.createElement('option');
-                    option.value = opt.value;
+                    option.value = opt['value'];
                     option.textContent = displayText;
-                    if (opt.value === config.cdn_ip_method) {{
+                    if (opt['value'] === config.cdn_ip_method) {{
                         option.selected = true;
                     }}
                     cdnIpSelect.appendChild(option);
@@ -4572,7 +4182,7 @@ class WebHandler:
             document.getElementById('cancelEditBtn').classList.remove('hidden');
 
             // 滚动到表单
-            document.querySelector('#tab-clients .bg-white').scrollIntoView({{ behavior: 'smooth' }});
+            document.querySelector('#tab-clients .bg-white').scrollIntoView({{ 'behavior': 'smooth' }});
         }}
 
         async function addClient() {{
@@ -4646,7 +4256,7 @@ class WebHandler:
                         'Content-Type': 'application/json',
                         'Authorization': 'Bearer ' + token
                     }},
-                    body: JSON.stringify({{ client_id: clientId }})
+                    body: JSON.stringify({{ 'client_id': clientId }})
                 }});
                 const data = await response.json();
 
@@ -4682,10 +4292,7 @@ class WebHandler:
             }}
         }});
 
-        // 审计日志相关变量
-        let currentLogPage = 0;
-        const logsPerPage = 20;
-        let currentLogFilter = '';
+
 
         // HTML 转义函数，防止 XSS 攻击
         function escapeHtml(text) {{
@@ -4695,98 +4302,10 @@ class WebHandler:
             return div.innerHTML;
         }}
 
-        async function loadLogs() {{
-            try {{
-                console.log('开始加载审计日志...');
-                const response = await fetch(basePath + 'api/logs?limit=' + logsPerPage + '&offset=' + (currentLogPage * logsPerPage) + '&action=' + currentLogFilter, {{
-                    headers: {{ 'Authorization': 'Bearer ' + token }}
-                }});
-                const data = await response.json();
-                console.log('审计日志响应:', data);
-                if (!data.success) {{
-                    console.error('加载日志失败:', data.message);
-                    document.getElementById('logTable').innerHTML = '<tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">加载失败: ' + escapeHtml(data.message || '未知错误') + '</td></tr>';
-                    return;
-                }}
-
-                document.getElementById('logCount').textContent = '共 ' + data.total + ' 条日志';
-                const tbody = document.getElementById('logTable');
-                if (data.logs.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="5" class="px-6 py-12 text-center text-slate-400 font-medium">暂无日志</td></tr>';
-                }} else {{
-                    const actionLabels = {{
-                        'LOGIN': {{ text: '登录', class: 'bg-blue-100 text-blue-600' }},
-                        'LOGOUT': {{ text: '登出', class: 'bg-gray-100 text-gray-600' }},
-                        'CLIENT_ADD': {{ text: '添加客户端', class: 'bg-green-100 text-green-600' }},
-                        'CLIENT_UPDATE': {{ text: '更新客户端', class: 'bg-yellow-100 text-yellow-600' }},
-                        'CLIENT_DELETE': {{ text: '删除客户端', class: 'bg-red-100 text-red-600' }},
-                        'CONFIG_UPDATE': {{ text: '配置更新', class: 'bg-purple-100 text-purple-600' }},
-                        'AUTHORIZE': {{ text: '授权', class: 'bg-indigo-100 text-indigo-600' }},
-                        'TOKEN_EXCHANGE': {{ text: '令牌交换', class: 'bg-teal-100 text-teal-600' }},
-                        'CLEAR_LOGS': {{ text: '清空日志', class: 'bg-orange-100 text-orange-600' }}
-                    }};
-
-                    tbody.innerHTML = data.logs.map(log => {{
-                        const action = actionLabels[log.action] || {{ text: escapeHtml(log.action), class: 'bg-slate-100 text-slate-600' }};
-                        return '<tr class="hover:bg-slate-50/50 transition-colors">' +
-                            '<td class="px-3 py-4 text-sm text-slate-600">' + new Date(log.timestamp * 1000).toLocaleString() + '</td>' +
-                            '<td class="px-3 py-4"><span class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ' + action.class + '">' + action.text + '</span></td>' +
-                            '<td class="px-3 py-4 text-sm text-slate-600">' + (escapeHtml(log.details) || '-') + '</td>' +
-                            '<td class="px-3 py-4 text-sm text-slate-600">' + (escapeHtml(log.user) || '-') + '</td>' +
-                            '<td class="px-3 py-4 text-sm text-slate-600 font-mono">' + (escapeHtml(log.ip) || '-') + '</td>' +
-                        '</tr>';
-                    }}).join('');
-                }}
-
-                // 更新分页按钮状态
-                document.getElementById('prevLogPage').disabled = currentLogPage === 0;
-                document.getElementById('nextLogPage').disabled = (currentLogPage + 1) * logsPerPage >= data.total;
-                document.getElementById('logPageInfo').textContent = '第 ' + (currentLogPage + 1) + ' 页';
-            }} catch (err) {{
-                console.error('加载日志失败:', err);
-            }}
-        }}
-
-        function changeLogPage(delta) {{
-            currentLogPage += delta;
-            if (currentLogPage < 0) currentLogPage = 0;
-            loadLogs();
-        }}
-
-        async function clearLogs() {{
-            if (!confirm('确定要清空所有审计日志吗？此操作不可恢复。')) return;
-
-            try {{
-                const response = await fetch(basePath + 'api/logs/clear', {{
-                    method: 'POST',
-                    headers: {{ 'Authorization': 'Bearer ' + token }}
-                }});
-                const data = await response.json();
-
-                if (data.success) {{
-                    showToast('日志已清空', 'success');
-                    currentLogPage = 0;
-                    loadLogs();
-                }} else {{
-                    showToast(data.message || '清空失败', 'error');
-                }}
-            }} catch (err) {{
-                console.error('清空日志失败:', err);
-                showToast('网络错误，请重试', 'error');
-            }}
-        }}
-
-        // 日志过滤器事件监听
-        document.getElementById('logFilter').addEventListener('change', function(e) {{
-            currentLogFilter = e.target.value;
-            currentLogPage = 0;
-            loadLogs();
-        }});
-
         loadConfig();
         loadSessions();
         loadClients();
-        loadLogs();
+        // 不在页面加载时调用loadLogs()，只在点击审计日志标签时才加载
         setInterval(loadSessions, 5000);
     </script>
 </body>
@@ -4802,9 +4321,19 @@ class WebHandler:
         scope: str = "openid profile",
         client: dict = None,
     ) -> str:
-        verify_group_id = self._get_web_config("verify_group_id", "")
-        enable_group_verify = self._get_web_config("enable_group_verify", True)
-        enable_private_verify = self._get_web_config("enable_private_verify", True)
+        # 优先使用客户端配置，如果没有则使用全局配置
+        if client:
+            verify_group_id = client.get("verify_group_id", "") or self._get_web_config("verify_group_id", "")
+            enable_group_verify = client.get("enable_group_verify", None)
+            if enable_group_verify is None:
+                enable_group_verify = self._get_web_config("enable_group_verify", True)
+            enable_private_verify = client.get("enable_private_verify", None)
+            if enable_private_verify is None:
+                enable_private_verify = self._get_web_config("enable_private_verify", True)
+        else:
+            verify_group_id = self._get_web_config("verify_group_id", "")
+            enable_group_verify = self._get_web_config("enable_group_verify", True)
+            enable_private_verify = self._get_web_config("enable_private_verify", True)
         theme_color = self._get_web_config("theme_color", "#50b6fe")
         icon_url = self._get_web_config(
             "icon_url",
@@ -5198,7 +4727,6 @@ class ChuyeOIDCPlugin(Star):
         self.config = config
         self.config_manager: ConfigManager | None = None
         self.client_manager: ClientManager | None = None
-        self.audit_log_manager: AuditLogManager | None = None
         self.oidc_server: OIDCServer | None = None
         self.web_handler: WebHandler | None = None
         self._cleanup_task: asyncio.Task | None = None
@@ -5255,10 +4783,8 @@ class ChuyeOIDCPlugin(Star):
 
         self.config_manager = ConfigManager(self)
         self.client_manager = ClientManager()
-        # 初始化审计日志管理器，使用与配置管理器相同的数据目录
-        data_dir = StarTools.get_data_dir() / "chuyeoidc"
-        self.audit_log_manager = AuditLogManager(data_dir)
         # 初始化 SessionManager 用于会话持久化
+        data_dir = StarTools.get_data_dir() / "chuyeoidc"
         self.session_manager = SessionManager(data_dir)
         self.oidc_server = OIDCServer(
             self, self.config_manager, self.client_manager, self.session_manager
@@ -5268,7 +4794,6 @@ class ChuyeOIDCPlugin(Star):
             self.oidc_server,
             self.config_manager,
             self.client_manager,
-            self.audit_log_manager,
         )
 
         port = self._get_config("web_port", 33145)
@@ -5387,20 +4912,9 @@ class ChuyeOIDCPlugin(Star):
                     try:
                         rotated = await self.oidc_server.key_manager.rotate_keys()
                         if rotated:
-                            self.audit_log_manager.log(
-                                action="KEY_ROTATION",
-                                details="密钥轮换成功",
-                                user="system",
-                                ip="",
-                            )
+                            logger.info("密钥轮换成功")
                     except Exception as e:
                         logger.error(f"密钥轮换失败: {e}")
-                        self.audit_log_manager.log(
-                            action="KEY_ROTATION_FAILED",
-                            details=f"密钥轮换失败: {str(e)}",
-                            user="system",
-                            ip="",
-                        )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -5421,15 +4935,36 @@ class ChuyeOIDCPlugin(Star):
             yield event.plain_result("服务未初始化")
             return
 
+        # 先获取验证码数据，以便获取客户端配置
+        verify_code_data = self.oidc_server.session_manager.get_verify_code(code)
+
         # 检查群聊限制
         message_type = event.get_message_type()
         is_group = (
             message_type.value == "GroupMessage" or message_type.name == "GROUP_MESSAGE"
         )
         group_id = event.get_group_id() if is_group else ""
-        enable_group_verify = self._get_web_config("enable_group_verify", True)
-        enable_private_verify = self._get_web_config("enable_private_verify", True)
-        verify_group_id = self._get_web_config("verify_group_id", "")
+
+        # 获取验证码对应的客户端ID，优先使用客户端配置
+        client_id = verify_code_data.get("client_id", "") if verify_code_data else ""
+        client = None
+        if client_id:
+            client = self.client_manager.get_client(client_id)
+            logger.info(f"验证码对应的客户端: {client_id}")
+
+        # 优先使用客户端配置，如果没有则使用全局配置
+        if client:
+            enable_group_verify = client.get("enable_group_verify", None)
+            if enable_group_verify is None:
+                enable_group_verify = self._get_web_config("enable_group_verify", True)
+            enable_private_verify = client.get("enable_private_verify", None)
+            if enable_private_verify is None:
+                enable_private_verify = self._get_web_config("enable_private_verify", True)
+            verify_group_id = client.get("verify_group_id", "") or self._get_web_config("verify_group_id", "")
+        else:
+            enable_group_verify = self._get_web_config("enable_group_verify", True)
+            enable_private_verify = self._get_web_config("enable_private_verify", True)
+            verify_group_id = self._get_web_config("verify_group_id", "")
 
         logger.info(
             f"消息类型: {message_type}, is_group: {is_group}, group_id: {group_id}"
@@ -5464,8 +4999,17 @@ class ChuyeOIDCPlugin(Star):
         )
 
         if success:
-            # 使用自定义验证成功消息，如果没有设置则使用默认消息
-            custom_message = self._get_web_config("verify_success_message", "")
+            # 获取验证码对应的客户端ID，优先使用客户端配置的验证成功消息
+            verify_code_data = self.oidc_server.session_manager.get_verify_code(code)
+            client_id = verify_code_data.get("client_id", "") if verify_code_data else ""
+            custom_message = ""
+            if client_id:
+                client = self.client_manager.get_client(client_id)
+                if client:
+                    custom_message = client.get("verify_success_message", "")
+            # 如果客户端没有设置，则使用全局配置
+            if not custom_message:
+                custom_message = self._get_web_config("verify_success_message", "")
             if custom_message:
                 yield event.plain_result(custom_message)
             else:
@@ -5486,67 +5030,109 @@ class ChuyeOIDCPlugin(Star):
             return
 
         if not self.oidc_server:
+            logger.warning("OIDC服务器未初始化")
             return
 
         code = message_str
+        logger.info(f"收到验证码: {code}")
 
         # 先检查验证码是否存在且有效，避免不必要的群聊检查
         verify_code_data = self.oidc_server.session_manager.get_verify_code(code)
         if not verify_code_data:
+            logger.warning(f"验证码不存在: {code}")
             # 验证码不存在，静默处理（不回复）
             return
 
+        logger.info(f"验证码数据: {verify_code_data}")
+
         # 检查验证码是否已使用
         if verify_code_data.get("used", False):
+            logger.warning(f"验证码已使用: {code}")
             # 验证码已使用，静默处理
             return
 
         # 检查验证码是否过期
         expire_seconds = self._get_web_config("code_expire_seconds", 300)
         if time.time() - verify_code_data.get("created_at", 0) > expire_seconds:
+            logger.warning(f"验证码已过期: {code}")
             # 验证码已过期，静默处理
             return
 
         # 检查群聊限制
         message_type = event.get_message_type()
+        logger.info(f"消息类型: {message_type}, value={getattr(message_type, 'value', 'N/A')}, name={getattr(message_type, 'name', 'N/A')}")
         is_group = (
             message_type.value == "GroupMessage" or message_type.name == "GROUP_MESSAGE"
         )
         group_id = event.get_group_id() if is_group else ""
-        enable_group_verify = self._get_web_config("enable_group_verify", True)
-        enable_private_verify = self._get_web_config("enable_private_verify", True)
-        verify_group_id = self._get_web_config("verify_group_id", "")
+
+        # 获取验证码对应的客户端ID，优先使用客户端配置
+        client_id = verify_code_data.get("client_id", "") if verify_code_data else ""
+        client = None
+        if client_id:
+            client = self.client_manager.get_client(client_id)
+            logger.info(f"验证码对应的客户端: {client_id}, 客户端数据: {client}")
+
+        # 优先使用客户端配置，如果没有则使用全局配置
+        if client:
+            enable_group_verify = client.get("enable_group_verify", None)
+            if enable_group_verify is None:
+                enable_group_verify = self._get_web_config("enable_group_verify", True)
+            enable_private_verify = client.get("enable_private_verify", None)
+            if enable_private_verify is None:
+                enable_private_verify = self._get_web_config("enable_private_verify", True)
+            verify_group_id = client.get("verify_group_id", "") or self._get_web_config("verify_group_id", "")
+        else:
+            enable_group_verify = self._get_web_config("enable_group_verify", True)
+            enable_private_verify = self._get_web_config("enable_private_verify", True)
+            verify_group_id = self._get_web_config("verify_group_id", "")
+
+        logger.info(f"is_group={is_group}, group_id={group_id}, enable_group_verify={enable_group_verify}, enable_private_verify={enable_private_verify}, verify_group_id={verify_group_id}")
 
         if is_group:
             # 群聊消息
             if not enable_group_verify:
+                logger.warning(f"群聊验证已禁用")
                 return
             # 检查是否在允许的群聊中
             allowed_groups = [
                 g.strip() for g in verify_group_id.split(",") if g.strip()
             ]
+            logger.info(f"允许的群聊: {allowed_groups}, 当前群: {group_id}")
             if allowed_groups and group_id not in allowed_groups:
+                logger.warning(f"群聊不在允许列表中: {group_id}")
                 return
         else:
             # 私聊消息
             if not enable_private_verify:
+                logger.warning(f"私聊验证已禁用")
                 return
 
         user_id = event.get_sender_id()
         user_name = event.get_sender_name()
+        logger.info(f"准备验证: user_id={user_id}, user_name={user_name}")
 
         # 执行验证
         success, result = await self.oidc_server.verify_code_submit(
             code, user_id, {"id": user_id, "name": user_name}
         )
+        logger.info(f"验证结果: success={success}, result={result}")
 
         # 只有验证成功时才发送成功指令
         if success:
             logger.info(
                 f"验证码验证成功: user_id={user_id}, session_id={result[:8]}..."
             )
-            # 使用自定义验证成功消息，如果没有设置则使用默认消息
-            custom_message = self._get_web_config("verify_success_message", "")
+            # 获取验证码对应的客户端ID，优先使用客户端配置的验证成功消息
+            client_id = verify_code_data.get("client_id", "") if verify_code_data else ""
+            custom_message = ""
+            if client_id:
+                client = self.client_manager.get_client(client_id)
+                if client:
+                    custom_message = client.get("verify_success_message", "")
+            # 如果客户端没有设置，则使用全局配置
+            if not custom_message:
+                custom_message = self._get_web_config("verify_success_message", "")
             if custom_message:
                 yield event.plain_result(custom_message)
             else:
