@@ -292,7 +292,6 @@ class VerifyCode:
     used: bool = False
 
 
-
 class KeyManager:
     """密钥管理器
 
@@ -4323,13 +4322,17 @@ class WebHandler:
     ) -> str:
         # 优先使用客户端配置，如果没有则使用全局配置
         if client:
-            verify_group_id = client.get("verify_group_id", "") or self._get_web_config("verify_group_id", "")
+            verify_group_id = client.get("verify_group_id", "") or self._get_web_config(
+                "verify_group_id", ""
+            )
             enable_group_verify = client.get("enable_group_verify", None)
             if enable_group_verify is None:
                 enable_group_verify = self._get_web_config("enable_group_verify", True)
             enable_private_verify = client.get("enable_private_verify", None)
             if enable_private_verify is None:
-                enable_private_verify = self._get_web_config("enable_private_verify", True)
+                enable_private_verify = self._get_web_config(
+                    "enable_private_verify", True
+                )
         else:
             verify_group_id = self._get_web_config("verify_group_id", "")
             enable_group_verify = self._get_web_config("enable_group_verify", True)
@@ -4959,8 +4962,12 @@ class ChuyeOIDCPlugin(Star):
                 enable_group_verify = self._get_web_config("enable_group_verify", True)
             enable_private_verify = client.get("enable_private_verify", None)
             if enable_private_verify is None:
-                enable_private_verify = self._get_web_config("enable_private_verify", True)
-            verify_group_id = client.get("verify_group_id", "") or self._get_web_config("verify_group_id", "")
+                enable_private_verify = self._get_web_config(
+                    "enable_private_verify", True
+                )
+            verify_group_id = client.get("verify_group_id", "") or self._get_web_config(
+                "verify_group_id", ""
+            )
         else:
             enable_group_verify = self._get_web_config("enable_group_verify", True)
             enable_private_verify = self._get_web_config("enable_private_verify", True)
@@ -5001,7 +5008,9 @@ class ChuyeOIDCPlugin(Star):
         if success:
             # 获取验证码对应的客户端ID，优先使用客户端配置的验证成功消息
             verify_code_data = self.oidc_server.session_manager.get_verify_code(code)
-            client_id = verify_code_data.get("client_id", "") if verify_code_data else ""
+            client_id = (
+                verify_code_data.get("client_id", "") if verify_code_data else ""
+            )
             custom_message = ""
             if client_id:
                 client = self.client_manager.get_client(client_id)
@@ -5060,7 +5069,9 @@ class ChuyeOIDCPlugin(Star):
 
         # 检查群聊限制
         message_type = event.get_message_type()
-        logger.info(f"消息类型: {message_type}, value={getattr(message_type, 'value', 'N/A')}, name={getattr(message_type, 'name', 'N/A')}")
+        logger.info(
+            f"消息类型: {message_type}, value={getattr(message_type, 'value', 'N/A')}, name={getattr(message_type, 'name', 'N/A')}"
+        )
         is_group = (
             message_type.value == "GroupMessage" or message_type.name == "GROUP_MESSAGE"
         )
@@ -5080,14 +5091,20 @@ class ChuyeOIDCPlugin(Star):
                 enable_group_verify = self._get_web_config("enable_group_verify", True)
             enable_private_verify = client.get("enable_private_verify", None)
             if enable_private_verify is None:
-                enable_private_verify = self._get_web_config("enable_private_verify", True)
-            verify_group_id = client.get("verify_group_id", "") or self._get_web_config("verify_group_id", "")
+                enable_private_verify = self._get_web_config(
+                    "enable_private_verify", True
+                )
+            verify_group_id = client.get("verify_group_id", "") or self._get_web_config(
+                "verify_group_id", ""
+            )
         else:
             enable_group_verify = self._get_web_config("enable_group_verify", True)
             enable_private_verify = self._get_web_config("enable_private_verify", True)
             verify_group_id = self._get_web_config("verify_group_id", "")
 
-        logger.info(f"is_group={is_group}, group_id={group_id}, enable_group_verify={enable_group_verify}, enable_private_verify={enable_private_verify}, verify_group_id={verify_group_id}")
+        logger.info(
+            f"is_group={is_group}, group_id={group_id}, enable_group_verify={enable_group_verify}, enable_private_verify={enable_private_verify}, verify_group_id={verify_group_id}"
+        )
 
         if is_group:
             # 群聊消息
@@ -5124,7 +5141,9 @@ class ChuyeOIDCPlugin(Star):
                 f"验证码验证成功: user_id={user_id}, session_id={result[:8]}..."
             )
             # 获取验证码对应的客户端ID，优先使用客户端配置的验证成功消息
-            client_id = verify_code_data.get("client_id", "") if verify_code_data else ""
+            client_id = (
+                verify_code_data.get("client_id", "") if verify_code_data else ""
+            )
             custom_message = ""
             if client_id:
                 client = self.client_manager.get_client(client_id)
