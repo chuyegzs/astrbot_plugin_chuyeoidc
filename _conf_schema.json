@@ -91,20 +91,6 @@
         "default": 15,
         "minimum": 5,
         "maximum": 60
-      },
-      "enable_audit_log": {
-        "description": "启用审计日志",
-        "type": "bool",
-        "hint": "是否记录关键操作日志（登录、授权、客户端管理等）",
-        "default": true
-      },
-      "max_audit_logs": {
-        "description": "最大审计日志条数",
-        "type": "int",
-        "hint": "审计日志的最大保留条数，超过将自动清理旧日志",
-        "default": 1000,
-        "minimum": 100,
-        "maximum": 10000
       }
     }
   }

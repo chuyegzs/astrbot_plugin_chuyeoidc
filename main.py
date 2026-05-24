@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.0.8
+版本: v1.1.1
 """
 
 import asyncio
@@ -724,8 +724,8 @@ class LogSanitizer:
 class SessionManager:
     """会话管理器
 
-    管理 OIDC 认证会话、验证码和访问令牌的持久化存储。
-    数据存储在 AstrBot data 目录下，重启后不会丢失。
+    管理 OIDC 认证会话、验证码和访问令牌。
+    数据存储在 AstrBot data 目录下，防止更新/重装插件时数据丢失。
     """
 
     def __init__(self, data_dir: str):
@@ -735,17 +735,27 @@ class SessionManager:
         self._sessions: dict = {}
         self._verify_codes: dict = {}
         self._access_tokens: dict = {}
+        self._verification_events: dict[str, asyncio.Event] = {}
         self._lock = asyncio.Lock()
+        self._remove_legacy_access_tokens_file()
         self._load_all()
+
+    def _remove_legacy_access_tokens_file(self):
+        if os.path.exists(self.access_tokens_file):
+            try:
+                os.remove(self.access_tokens_file)
+                logger.info("已移除历史 OIDC 访问令牌文件")
+            except Exception as e:
+                logger.error(f"移除历史 OIDC 访问令牌文件失败: {e}")
 
     def _load_all(self):
         """加载所有会话数据"""
         self._sessions = self._load_json(self.sessions_file)
         self._verify_codes = self._load_json(self.verify_codes_file)
-        self._access_tokens = self._load_json(self.access_tokens_file)
+        self._access_tokens = {}
         logger.info(
             f"已加载会话数据: {len(self._sessions)} 个会话, "
-            f"{len(self._verify_codes)} 个验证码, {len(self._access_tokens)} 个令牌"
+            f"{len(self._verify_codes)} 个验证码, {len(self._access_tokens)} 个运行期令牌"
         )
 
     def _load_json(self, filepath: str) -> dict:
@@ -779,16 +789,14 @@ class SessionManager:
             self._save_json(self.verify_codes_file, self._verify_codes)
 
     async def save_access_tokens(self):
-        """保存访问令牌数据（异步）"""
-        async with self._lock:
-            self._save_json(self.access_tokens_file, self._access_tokens)
+        """访问令牌只保存在运行期内存中，不写入磁盘"""
+        return
 
     async def save_all(self):
-        """保存所有数据"""
+        """保存所有可持久化数据"""
         async with self._lock:
             self._save_json(self.sessions_file, self._sessions)
             self._save_json(self.verify_codes_file, self._verify_codes)
-            self._save_json(self.access_tokens_file, self._access_tokens)
 
     # 会话操作
     def get_session(self, session_id: str) -> dict | None:
@@ -797,8 +805,20 @@ class SessionManager:
     def set_session(self, session_id: str, session_data: dict):
         self._sessions[session_id] = session_data
 
+    def get_verification_event(self, session_id: str) -> asyncio.Event:
+        event = self._verification_events.get(session_id)
+        if event is None:
+            event = asyncio.Event()
+            self._verification_events[session_id] = event
+        return event
+
+    def notify_session_verified(self, session_id: str):
+        event = self.get_verification_event(session_id)
+        event.set()
+
     def delete_session(self, session_id: str):
         self._sessions.pop(session_id, None)
+        self._verification_events.pop(session_id, None)
 
     def get_all_sessions(self) -> dict:
         return self._sessions.copy()
@@ -858,6 +878,7 @@ class ConfigManager:
             "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%BA%95.png",
             "jwt_secret": "",  # JWT 签名密钥，留空则自动生成
             "public_url": "",  # 公共访问URL，用于OIDC issuer，如 https://example.com
+            "ip_rate_limit": 0,
         }
 
         if os.path.exists(self.config_file):
@@ -1244,9 +1265,10 @@ class OIDCServer:
         now_ts = int(now.timestamp())
         expires = now_ts + 3600
 
+        user_id = session.verified_user_id or ""
         payload = {
             "iss": self.get_issuer(),
-            "sub": session.verified_user_id or "",
+            "sub": user_id,
             "aud": session.client_id or "",
             "exp": expires,
             "iat": now_ts,
@@ -1401,6 +1423,7 @@ class OIDCServer:
                 "name": user_id,
             }
             self.session_manager.set_session(verify_code.session_id, session_data)
+            self.session_manager.notify_session_verified(verify_code.session_id)
             logger.info(f"验证成功: session_id={verify_code.session_id[:8]}...")
 
             return True, verify_code.session_id
@@ -1889,8 +1912,8 @@ class WebHandler:
         ):
             logger.warning(f"验证码验证速率限制触发: IP={ip}, 尝试次数={attempts}")
 
-        # 从配置读取IP速率限制，默认60次/分钟
-        ip_rate_limit = self._get_web_config("ip_rate_limit", 60)
+        # 从配置读取 IP 速率限制，默认 0 表示无限制
+        ip_rate_limit = self._get_web_config("ip_rate_limit", 0)
         if ip_rate_limit == 0:
             ip_rate_limit = 999999  # 0表示无限制
 
@@ -2122,6 +2145,7 @@ class WebHandler:
                 "verify": self.handle_verify_page,
                 "api/verify": self.handle_api_verify,
                 "api/session/status": self.handle_api_session_status,
+                "api/session/wait": self.handle_api_session_wait,
             }
 
             handler = route_handlers.get(path)
@@ -2282,8 +2306,7 @@ class WebHandler:
             "verify_group_id": self._get_web_config("verify_group_id", ""),
             "code_expire_seconds": self._get_web_config("code_expire_seconds", 300),
             "code_length": self._get_web_config("code_length", 6),
-            "poll_interval": self._get_web_config("poll_interval", 1),
-            "ip_rate_limit": self._get_web_config("ip_rate_limit", 60),
+            "ip_rate_limit": self._get_web_config("ip_rate_limit", 0),
             "verify_success_message": self._get_web_config(
                 "verify_success_message", ""
             ),
@@ -2338,22 +2361,14 @@ class WebHandler:
                         status=400,
                     )
 
-            if "poll_interval" in data:
-                value = data["poll_interval"]
-                if not isinstance(value, int) or value < 1 or value > 30:
-                    return web.json_response(
-                        {"success": False, "message": "轮询间隔必须在 1-30 秒之间"},
-                        status=400,
-                    )
-
             # 验证单IP请求速率限制
             if "ip_rate_limit" in data:
                 value = data["ip_rate_limit"]
-                if not isinstance(value, int) or value < 0 or value > 10000:
+                if not isinstance(value, int) or value < 0 or (0 < value < 30):
                     return web.json_response(
                         {
                             "success": False,
-                            "message": "单IP请求速率限制必须在 0-10000 之间",
+                            "message": "单IP请求速率限制必须为 0 或大于等于 30",
                         },
                         status=400,
                     )
@@ -2395,7 +2410,6 @@ class WebHandler:
                 "verify_group_id",
                 "code_expire_seconds",
                 "code_length",
-                "poll_interval",
                 "ip_rate_limit",
                 "verify_success_message",
                 "theme_color",
@@ -2705,9 +2719,12 @@ class WebHandler:
         )
         if not allowed:
             logger.warning(f"授权端点速率限制触发: IP={ip}")
-            return web.json_response(
-                {"error": "rate_limit_exceeded", "error_description": error_msg},
-                status=429,
+            return self._render_error_page(
+                "请求过于频繁",
+                "当前授权请求触发了访问频率限制，系统已临时拒绝继续处理。",
+                error_msg or "同一 IP 在短时间内发起了过多授权请求。",
+                "请稍后再试；如果你是管理员，可以在管理后台调整单 IP 请求速率限制。",
+                status_code=429,
             )
 
         redirect_uri = request.query.get("redirect_uri", "")
@@ -2752,12 +2769,12 @@ class WebHandler:
             logger.warning(
                 f"redirect_uri 不匹配: client_id={client_id}, uri={decoded_redirect_uri}"
             )
-            return web.json_response(
-                {
-                    "error": "invalid_request",
-                    "error_description": "redirect_uri does not match registered redirect_url",
-                },
-                status=400,
+            return self._render_error_page(
+                "重定向地址不匹配",
+                "OIDC 授权请求中的重定向地址与客户端配置不一致，系统已阻止本次授权。",
+                "当前请求携带的 redirect_uri 未通过客户端重定向地址校验。",
+                "请返回应用重新发起登录；如果你是管理员，请检查客户端配置中的重定向 URL 是否与应用填写的回调地址完全一致。",
+                status_code=400,
             )
 
         # 使用解码后的 redirect_uri 创建会话，确保与 token 端点比较时一致
@@ -2822,7 +2839,7 @@ class WebHandler:
         if grant_type == "authorization_code":
             # 使用授权码换取 token
             if not client_id:
-                logger.warning(f"Token请求: 缺少client_id")
+                logger.warning("Token请求: 缺少client_id")
                 return web.json_response(
                     {
                         "error": "invalid_client",
@@ -2942,7 +2959,7 @@ class WebHandler:
         user_name = user_name.replace("\r", "").replace("\n", "").strip()
 
         userinfo_response = {
-            "sub": user_id or user_info.get("id", ""),
+            "sub": user_id,
             "name": user_name,
             "preferred_username": user_name,
             "nickname": user_name,
@@ -2995,27 +3012,41 @@ class WebHandler:
             "token_endpoint": f"{base_url}/token",
             "userinfo_endpoint": f"{base_url}/userinfo",
             "jwks_uri": f"{base_url}/.well-known/jwks.json",
+            "registration_endpoint": None,
             "response_types_supported": ["code"],
+            "response_modes_supported": ["query"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
             "scopes_supported": ["openid", "profile", "email"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": [
                 "client_secret_post",
                 "client_secret_basic",
             ],
-            # 注意：PKCE 未实现，不声明 code_challenge_methods_supported
-            # 避免误导客户端启用 PKCE 而实际无防护
             "claims_supported": [
                 "sub",
                 "name",
                 "nickname",
+                "preferred_username",
                 "email",
+                "email_verified",
+                "picture",
                 "iss",
                 "aud",
                 "exp",
                 "iat",
+                "auth_time",
             ],
+            "code_challenge_methods_supported": [],
+            "request_parameter_supported": False,
+            "request_uri_parameter_supported": False,
+            "require_request_uri_registration": False,
+            "claims_parameter_supported": False,
+            "frontchannel_logout_supported": False,
+            "frontchannel_logout_session_supported": False,
+            "backchannel_logout_supported": False,
+            "backchannel_logout_session_supported": False,
+            "authorization_response_iss_parameter_supported": False,
         }
 
         response = web.json_response(discovery)
@@ -3139,39 +3170,12 @@ class WebHandler:
                 {"success": False, "message": "服务器错误"}, status=500
             )
 
-    async def handle_api_session_status(self, request: web.Request) -> web.Response:
-        try:
-            ip = request.remote or ""
-
-            # 检查速率限制
-            allowed, error_msg = await self.verify_rate_limiter.check_and_record_limit(
-                "session_status", ip
+    def _session_status_response(self, session: AuthSession | None) -> web.Response:
+        if not session:
+            response = web.json_response(
+                {"success": True, "verified": False, "verified_user_id": None}
             )
-            if not allowed:
-                return web.json_response(
-                    {"success": False, "message": error_msg}, status=429
-                )
-
-            session_id = request.query.get("session_id", "")
-            if not session_id:
-                return web.json_response(
-                    {"success": False, "message": "缺少session_id"}, status=400
-                )
-
-            session = await self.oidc_server.get_session(session_id)
-            if not session:
-                # 会话不存在，返回未验证状态（而不是404），避免前端显示网络错误
-                response = web.json_response(
-                    {"success": True, "verified": False, "verified_user_id": None}
-                )
-                response.headers["Cache-Control"] = (
-                    "no-cache, no-store, must-revalidate"
-                )
-                response.headers["Pragma"] = "no-cache"
-                response.headers["Expires"] = "0"
-                return response
-
-            # 添加缓存控制头
+        else:
             response = web.json_response(
                 {
                     "success": True,
@@ -3179,15 +3183,126 @@ class WebHandler:
                     "verified_user_id": session.verified_user_id,
                 }
             )
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-            response.headers["Expires"] = "0"
-            return response
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+    async def handle_api_session_status(self, request: web.Request) -> web.Response:
+        try:
+            session_id = request.query.get("session_id", "")
+            if not session_id:
+                return web.json_response(
+                    {"success": False, "message": "缺少session_id"}, status=400
+                )
+
+            session = await self.oidc_server.get_session(session_id)
+            return self._session_status_response(session)
         except Exception as e:
             logger.error(f"获取会话状态错误: {e}")
             return web.json_response(
                 {"success": False, "message": "服务器错误"}, status=500
             )
+
+    async def handle_api_session_wait(self, request: web.Request) -> web.Response:
+        try:
+            session_id = request.query.get("session_id", "")
+            if not session_id:
+                return web.json_response(
+                    {"success": False, "message": "缺少session_id"}, status=400
+                )
+
+            session = await self.oidc_server.get_session(session_id)
+            if not session or session.verified:
+                return self._session_status_response(session)
+
+            event = self.oidc_server.session_manager.get_verification_event(session_id)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=60)
+            except TimeoutError:
+                pass
+
+            session = await self.oidc_server.get_session(session_id)
+            return self._session_status_response(session)
+        except Exception as e:
+            logger.error(f"等待会话验证错误: {e}")
+            return web.json_response(
+                {"success": False, "message": "服务器错误"}, status=500
+            )
+
+    def _render_error_page(
+        self,
+        title: str,
+        description: str,
+        reason: str,
+        suggestion: str,
+        status_code: int = 400,
+    ) -> web.Response:
+        theme_color = self._get_web_config("theme_color", "#50b6fe")
+        icon_url = self._get_web_config(
+            "icon_url",
+            "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
+        )
+        favicon_url = self._get_web_config(
+            "favicon_url",
+            "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
+        )
+        theme_color_css = escape_css_value(theme_color)
+        favicon_url_safe = escape_html_attr(favicon_url)
+        icon_html = (
+            f'<img src="{escape_html_attr(icon_url)}" class="w-16 h-16 object-cover rounded-2xl" alt="icon">'
+            if icon_url
+            else """<svg xmlns="http://www.w3.org/2000/svg" class="w-16 h-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>"""
+        )
+        html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{escape_html(title)} - OIDC登录</title>
+    <link rel="icon" type="image/png" href="{favicon_url_safe}">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {{ --theme-color: {theme_color_css}; }}
+        body {{ background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 45%, #eef8ff 100%); }}
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center px-6 py-10 text-slate-800">
+    <div class="w-full max-w-xl flex flex-col items-center">
+        <main class="bg-white/90 backdrop-blur rounded-[2rem] shadow-2xl shadow-sky-100 border border-white p-8 sm:p-10">
+        <div class="flex flex-col items-center text-center gap-5">
+            <div class="text-[var(--theme-color)] bg-sky-50 rounded-3xl p-4">{icon_html}</div>
+            <div>
+                <p class="text-sm font-semibold text-slate-400 mb-2">OIDC 授权请求未完成</p>
+                <h1 class="text-3xl font-bold text-slate-900">{escape_html(title)}</h1>
+            </div>
+            <p class="text-base leading-7 text-slate-600">{escape_html(description)}</p>
+        </div>
+        <div class="mt-8 grid gap-4">
+            <section class="rounded-2xl bg-slate-50 border border-slate-100 p-5">
+                <h2 class="font-bold text-slate-900 mb-2">可能原因</h2>
+                <p class="text-sm leading-6 text-slate-600">{escape_html(reason)}</p>
+            </section>
+            <section class="rounded-2xl bg-sky-50 border border-sky-100 p-5">
+                <h2 class="font-bold text-slate-900 mb-2">下一步建议</h2>
+                <p class="text-sm leading-6 text-slate-600">{escape_html(suggestion)}</p>
+            </section>
+        </div>
+        <div class="mt-8 flex flex-col sm:flex-row gap-3 justify-center">
+            <button onclick="history.back()" class="px-6 py-3 rounded-2xl bg-[var(--theme-color)] text-white font-bold shadow-lg shadow-sky-100 hover:opacity-90 transition">返回上一页</button>
+            <button onclick="location.reload()" class="px-6 py-3 rounded-2xl bg-slate-100 text-slate-700 font-bold hover:bg-slate-200 transition">重新尝试</button>
+        </div>
+        </main>
+        <p class="text-center text-slate-400 text-sm mt-8">Powered by <a href="https://github.com/AstrBotDevs/AstrBot" target="_blank" class="text-[var(--theme-color)] hover:opacity-80">AstrBot</a> & <a href="https://www.chuyel.cn" target="_blank" class="text-[var(--theme-color)] hover:opacity-80">初叶🍂竹叶-Furry控</a></p>
+    </div>
+</body>
+</html>"""
+        return web.Response(
+            text=html_content,
+            status=status_code,
+            content_type="text/html",
+            charset="utf-8",
+        )
 
     def _render_login_page(
         self, theme_color: str = "#50b6fe", icon_url: str = "", favicon_url: str = ""
@@ -3564,14 +3679,9 @@ class WebHandler:
                                 <input type="number" id="codeExpire" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="60" max="1800">
                             </div>
                             <div>
-                                <label class="block text-sm font-bold text-slate-700 mb-2">轮询间隔 (秒)</label>
-                                <input type="number" id="pollInterval" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="1" max="30">
-                                <p class="text-xs text-slate-500 mt-2">验证页面检查状态的时间间隔，范围 1-30 秒</p>
-                            </div>
-                            <div>
                                 <label class="block text-sm font-bold text-slate-700 mb-2">单IP请求速率限制 (次/分钟)</label>
-                                <input type="number" id="ipRateLimit" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" max="10000">
-                                <p class="text-xs text-slate-500 mt-2">每个IP每分钟最多请求次数，0为无限制，建议30-10000</p>
+                                <input type="number" id="ipRateLimit" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" step="1">
+                                <p class="text-xs text-slate-500 mt-2">每个IP每分钟最多请求次数，0为无限制；启用限制时请填写 30 或更大数值</p>
                             </div>
                         </div>
                     </div>
@@ -3829,8 +3939,7 @@ class WebHandler:
 
                 document.getElementById('codeLength').value = config.code_length || 6;
                 document.getElementById('codeExpire').value = config.code_expire_seconds || 300;
-                document.getElementById('pollInterval').value = config.poll_interval || 1;
-                document.getElementById('ipRateLimit').value = config.ip_rate_limit || 60;
+                document.getElementById('ipRateLimit').value = config.ip_rate_limit ?? 0;
                 document.getElementById('enableGroupVerify').checked = config.enable_group_verify !== false;
                 document.getElementById('enablePrivateVerify').checked = config.enable_private_verify !== false;
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
@@ -3900,7 +4009,6 @@ class WebHandler:
             const config = {{
                 code_length: parseInt(document.getElementById('codeLength').value),
                 code_expire_seconds: parseInt(document.getElementById('codeExpire').value),
-                poll_interval: parseInt(document.getElementById('pollInterval').value),
                 ip_rate_limit: parseInt(document.getElementById('ipRateLimit').value),
                 enable_group_verify: document.getElementById('enableGroupVerify').checked,
                 enable_private_verify: document.getElementById('enablePrivateVerify').checked,
@@ -4304,7 +4412,6 @@ class WebHandler:
         loadConfig();
         loadSessions();
         loadClients();
-        // 不在页面加载时调用loadLogs()，只在点击审计日志标签时才加载
         setInterval(loadSessions, 5000);
     </script>
 </body>
@@ -4346,9 +4453,6 @@ class WebHandler:
             "favicon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
         )
-        poll_interval = self._get_web_config("poll_interval", 1)
-        poll_interval_ms = max(1000, min(30000, poll_interval * 1000))
-
         # 获取自定义字体设置
         custom_font_url = self._get_web_config("custom_font_url", "")
         if custom_font_url:
@@ -4462,7 +4566,6 @@ class WebHandler:
                 scope_items=scope_items,
                 group_info=group_info,
                 private_info=private_info,
-                poll_interval_ms=poll_interval_ms,
                 custom_font_link=custom_font_link,
                 custom_font_family=custom_font_family,
             )
@@ -4482,7 +4585,8 @@ class WebHandler:
                 scope_items,
                 group_info,
                 private_info,
-                poll_interval_ms,
+                custom_font_link,
+                custom_font_family,
             )
 
     def _render_verify_page_builtin(
@@ -4500,7 +4604,8 @@ class WebHandler:
         scope_items: str,
         group_info: str,
         private_info: str,
-        poll_interval_ms: int = 1000,
+        custom_font_link: str = "",
+        custom_font_family: str = "'Inter', -apple-system, sans-serif",
     ) -> str:
         """内置验证页面模板（备用）
 
@@ -4527,7 +4632,6 @@ class WebHandler:
                 scope_items=scope_items,
                 group_info=group_info,
                 private_info=private_info,
-                poll_interval_ms=poll_interval_ms,
                 custom_font_link=custom_font_link,
                 custom_font_family=custom_font_family,
             )
@@ -4549,9 +4653,6 @@ class WebHandler:
             "favicon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
         )
-        poll_interval = self._get_web_config("poll_interval", 1)
-        poll_interval_ms = max(1000, min(30000, poll_interval * 1000))
-
         # 安全处理 icon_html，转义 URL
         icon_html = (
             f'<img src="{escape_html_attr(icon_url)}" class="h-16 w-16 object-cover rounded-lg" alt="icon">'
@@ -4569,12 +4670,11 @@ class WebHandler:
                 icon_html=icon_html,
                 favicon_url=escape_html_attr(favicon_url),
                 code=escape_html(code),
-                poll_interval_ms=poll_interval_ms,
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}，使用内置模板")
             return self._render_verify_input_page_builtin(
-                theme_color, icon_html, favicon_url, code, poll_interval_ms
+                theme_color, icon_html, favicon_url, code
             )
 
     def _render_verify_input_page_builtin(
@@ -4583,7 +4683,6 @@ class WebHandler:
         icon_html: str,
         favicon_url: str,
         code: str,
-        poll_interval_ms: int = 1000,
     ) -> str:
         """内置验证输入页面模板（备用）
 
@@ -4662,8 +4761,6 @@ class WebHandler:
     </div>
 
     <script>
-        var POLL_INTERVAL_MS = {poll_interval_ms};
-
         document.getElementById('verifyForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
             const code = document.getElementById('code').value;
@@ -4887,7 +4984,7 @@ class ChuyeOIDCPlugin(Star):
                     for site in list(getattr(self.oidc_server.runner, "_sites", [])):
                         try:
                             await site.stop()
-                        except:
+                        except Exception:
                             pass
             except Exception as e:
                 logger.debug(f"关闭连接时出错: {e}")
@@ -5109,7 +5206,7 @@ class ChuyeOIDCPlugin(Star):
         if is_group:
             # 群聊消息
             if not enable_group_verify:
-                logger.warning(f"群聊验证已禁用")
+                logger.warning("群聊验证已禁用")
                 return
             # 检查是否在允许的群聊中
             allowed_groups = [
@@ -5122,7 +5219,7 @@ class ChuyeOIDCPlugin(Star):
         else:
             # 私聊消息
             if not enable_private_verify:
-                logger.warning(f"私聊验证已禁用")
+                logger.warning("私聊验证已禁用")
                 return
 
         user_id = event.get_sender_id()
