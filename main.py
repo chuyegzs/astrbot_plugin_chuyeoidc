@@ -4549,8 +4549,6 @@ class WebHandler:
 
         # 从模板文件加载
         try:
-            from .templates import template_manager
-
             return template_manager.render(
                 "verify",
                 theme_color=escape_html(theme_color),
@@ -4662,10 +4660,8 @@ class WebHandler:
 
         # 从模板文件加载
         try:
-            from .templates import template_manager
-
-            template = template_manager.get_template("verify_input")
-            return template.format(
+            return template_manager.render(
+                "verify_input",
                 theme_color=escape_css_value(theme_color),
                 icon_html=icon_html,
                 favicon_url=escape_html_attr(favicon_url),
