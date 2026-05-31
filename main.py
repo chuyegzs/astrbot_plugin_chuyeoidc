@@ -174,6 +174,28 @@ def normalize_percent(value, default: int = 100) -> int:
     return max(0, min(100, percent))
 
 
+def normalize_verify_groups(groups) -> list:
+    normalized = []
+    if not isinstance(groups, list):
+        return normalized
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("group_id", "")).strip()
+        if not group_id:
+            continue
+        hide_group_id = bool(group.get("hide_group_id", False))
+        normalized.append(
+            {
+                "group_id": group_id,
+                "hide_group_id": hide_group_id,
+                "hidden": False if hide_group_id else bool(group.get("hidden", False)),
+                "hidden_message": str(group.get("hidden_message", "")).strip(),
+            }
+        )
+    return normalized
+
+
 def validate_url(url: str) -> bool:
     """验证 URL 格式是否合法
 
@@ -958,6 +980,7 @@ class ClientManager:
                                 cdata["verify_groups"] = [
                                     {
                                         "group_id": g.strip(),
+                                        "hide_group_id": False,
                                         "hidden": False,
                                         "hidden_message": "",
                                     }
@@ -967,6 +990,13 @@ class ClientManager:
                             else:
                                 cdata["verify_groups"] = []
                             need_save = True
+                        for group in cdata.get("verify_groups", []):
+                            if "hide_group_id" not in group:
+                                group["hide_group_id"] = False
+                                need_save = True
+                            if group.get("hide_group_id") and group.get("hidden"):
+                                group["hidden"] = False
+                                need_save = True
                     if need_save:
                         self._save_clients()
                     logger.info(
@@ -1028,12 +1058,15 @@ class ClientManager:
                 verify_groups = [
                     {
                         "group_id": g.strip(),
+                        "hide_group_id": False,
                         "hidden": False,
                         "hidden_message": "",
                     }
                     for g in verify_group_id.split(",")
                     if g.strip()
                 ]
+        else:
+            verify_groups = normalize_verify_groups(verify_groups)
         self._clients[client_id] = {
             "client_id": client_id,
             "client_secret": client_secret,
@@ -1085,6 +1118,7 @@ class ClientManager:
         if redirect_urls is not None:
             self._clients[client_id]["redirect_urls"] = redirect_urls
         if verify_groups is not None:
+            verify_groups = normalize_verify_groups(verify_groups)
             self._clients[client_id]["verify_groups"] = verify_groups
             group_ids = [
                 g.get("group_id", "")
@@ -2686,7 +2720,7 @@ class WebHandler:
             enable_private_verify = data.get("enable_private_verify", True)
             verify_group_id = data.get("verify_group_id", "")
             verify_success_message = data.get("verify_success_message", "")
-            verify_groups = data.get("verify_groups", [])
+            verify_groups = normalize_verify_groups(data.get("verify_groups", []))
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2766,7 +2800,11 @@ class WebHandler:
             enable_private_verify = data.get("enable_private_verify")
             verify_group_id = data.get("verify_group_id")
             verify_success_message = data.get("verify_success_message")
-            verify_groups = data.get("verify_groups")
+            verify_groups = (
+                normalize_verify_groups(data.get("verify_groups"))
+                if data.get("verify_groups") is not None
+                else None
+            )
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -3847,9 +3885,9 @@ class WebHandler:
                                 <input type="text" id="verifyGroupId" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="多个群号用英文逗号分隔">
                             </div>
                             <div>
-                                <label class="block text-sm font-bold text-slate-700 mb-2">默认群号隐藏话语</label>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">默认替换群号文字</label>
                                 <input type="text" id="defaultGroupHiddenMessage" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="人数已满">
-                                <p class="text-xs text-slate-500 mt-2">客户端群聊设置隐藏群号时，未单独配置隐藏话语则使用此默认值</p>
+                                <p class="text-xs text-slate-500 mt-2">客户端群聊启用替换群号文字时，未单独配置替换文字则使用此默认值</p>
                             </div>
                             <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
                                 <div>
@@ -4005,7 +4043,7 @@ class WebHandler:
                             </div>
                             <div id="verifyGroupsContainer" class="space-y-3">
                             </div>
-                            <p class="text-xs text-slate-500 mt-3">添加接收验证码的群聊，可单独设置是否隐藏群号及隐藏时显示的话语</p>
+                            <p class="text-xs text-slate-500 mt-3">添加接收验证码的群聊，可单独设置是否隐藏群号或将群号替换为指定文字</p>
                         </div>
 
                         <div class="md:col-span-2">
@@ -4059,7 +4097,7 @@ class WebHandler:
                     </div>
                 </div>
 
-                <div class="bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
+                <div class="mt-8 bg-white rounded-3xl shadow-sm border border-slate-100 overflow-hidden">
                     <div class="p-8 border-b border-slate-100 flex items-center justify-between">
                         <h2 class="text-lg font-bold flex items-center gap-2">
                             <span class="w-2 h-6 bg-primary rounded-full"></span>
@@ -4517,7 +4555,7 @@ class WebHandler:
             document.getElementById('cancelEditBtn').classList.add('hidden');
         }}
 
-        function addGroupEntry(groupId, hidden, hiddenMessage) {{
+        function addGroupEntry(groupId, hidden, hiddenMessage, hideGroupId) {{
             const container = document.getElementById('verifyGroupsContainer');
             const entryId = 'group-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5);
             const div = document.createElement('div');
@@ -4525,29 +4563,56 @@ class WebHandler:
             div.className = 'p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3';
             const safeGroupId = escapeHtml(groupId || '');
             const safeHiddenMsg = escapeHtml(hiddenMessage || '');
+            const replaceDisabled = !!hideGroupId;
+            const replaceEnabled = replaceDisabled ? false : !!hidden;
             div.innerHTML = `
-                <div class="flex items-center gap-3">
+                <div class="flex flex-col lg:flex-row lg:items-center gap-3">
                     <div class="flex-1">
                         <input type="text" class="group-id-input w-full px-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none text-sm" placeholder="输入群号" value="${{safeGroupId}}">
                     </div>
-                    <div class="flex items-center gap-2">
-                        <span class="text-xs font-bold text-slate-500">隐藏群号</span>
-                        <label class="relative inline-flex items-center cursor-pointer">
-                            <input type="checkbox" class="group-hidden-toggle sr-only peer" ${{hidden ? 'checked' : ''}} onchange="toggleGroupHiddenMsg(this)">
-                            <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
-                        </label>
+                    <div class="flex flex-wrap items-center gap-3">
+                        <div class="flex items-center gap-2 px-3 py-2 bg-white rounded-xl border border-slate-100">
+                            <span class="text-xs font-bold text-slate-500">隐藏群号</span>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" class="group-hide-id-toggle sr-only peer" ${{hideGroupId ? 'checked' : ''}} onchange="toggleGroupHideId(this)">
+                                <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                            </label>
+                        </div>
+                        <div class="group-replace-control flex items-center gap-2 px-3 py-2 bg-white rounded-xl border border-slate-100 ${{replaceDisabled ? 'opacity-50' : ''}}">
+                            <span class="text-xs font-bold text-slate-500">替换群号文字</span>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" class="group-hidden-toggle sr-only peer" ${{replaceEnabled ? 'checked' : ''}} ${{replaceDisabled ? 'disabled' : ''}} onchange="toggleGroupHiddenMsg(this)">
+                                <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                            </label>
+                        </div>
+                        <button onclick="document.getElementById('${{entryId}}').remove()" class="px-2 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl transition-all" title="删除">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
                     </div>
-                    <button onclick="document.getElementById('${{entryId}}').remove()" class="px-2 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl transition-all" title="删除">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                    </button>
                 </div>
-                <div class="group-hidden-msg-section ${{hidden ? '' : 'hidden'}}">
-                    <input type="text" class="group-hidden-msg-input w-full px-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none text-sm" placeholder="隐藏时显示的话语（留空使用全局默认）" value="${{safeHiddenMsg}}">
+                <div class="group-hidden-msg-section ${{replaceEnabled ? '' : 'hidden'}}">
+                    <input type="text" class="group-hidden-msg-input w-full px-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none text-sm" placeholder="替换后显示的文字（留空使用全局默认）" value="${{safeHiddenMsg}}">
                 </div>
             `;
             container.appendChild(div);
+        }}
+
+        function toggleGroupHideId(checkbox) {{
+            const entry = checkbox.closest('.space-y-3');
+            const replaceToggle = entry.querySelector('.group-hidden-toggle');
+            const replaceControl = entry.querySelector('.group-replace-control');
+            const msgSection = entry.querySelector('.group-hidden-msg-section');
+            if (checkbox.checked) {{
+                replaceToggle.checked = false;
+                replaceToggle.disabled = true;
+                replaceControl.classList.add('opacity-50');
+                msgSection.classList.add('hidden');
+            }} else {{
+                replaceToggle.disabled = false;
+                replaceControl.classList.remove('opacity-50');
+            }}
         }}
 
         function toggleGroupHiddenMsg(checkbox) {{
@@ -4565,8 +4630,14 @@ class WebHandler:
             return Array.from(entries).map(entry => {{
                 const groupId = entry.querySelector('.group-id-input').value.trim();
                 const hidden = entry.querySelector('.group-hidden-toggle').checked;
+                const hideGroupId = entry.querySelector('.group-hide-id-toggle').checked;
                 const hiddenMessage = entry.querySelector('.group-hidden-msg-input').value.trim();
-                return {{ group_id: groupId, hidden: hidden, hidden_message: hiddenMessage }};
+                return {{
+                    group_id: groupId,
+                    hide_group_id: hideGroupId,
+                    hidden: hidden,
+                    hidden_message: hiddenMessage
+                }};
             }}).filter(g => g.group_id);
         }}
 
@@ -4584,7 +4655,12 @@ class WebHandler:
             const groupsContainer = document.getElementById('verifyGroupsContainer');
             groupsContainer.innerHTML = '';
             if (verifyGroups && verifyGroups.length > 0) {{
-                verifyGroups.forEach(g => addGroupEntry(g.group_id || '', g.hidden || false, g.hidden_message || ''));
+                verifyGroups.forEach(g => addGroupEntry(
+                    g.group_id || '',
+                    g.hidden || false,
+                    g.hidden_message || '',
+                    g.hide_group_id || false
+                ));
             }}
 
             // 设置主页链接
@@ -4842,7 +4918,7 @@ class WebHandler:
                     g.strip() for g in verify_group_id.split(",") if g.strip()
                 ]
                 verify_groups = [
-                    {"group_id": g, "hidden": False, "hidden_message": ""}
+                    {"group_id": g, "hide_group_id": False, "hidden": False, "hidden_message": ""}
                     for g in groups
                 ]
             default_hidden_msg = self._get_web_config(
@@ -4853,7 +4929,9 @@ class WebHandler:
                 gid = g.get("group_id", "")
                 if not gid:
                     continue
-                if g.get("hidden", False):
+                if g.get("hide_group_id", False):
+                    continue
+                elif g.get("hidden", False):
                     msg = g.get("hidden_message", "") or default_hidden_msg
                     display_parts.append(escape_html(msg))
                 else:
