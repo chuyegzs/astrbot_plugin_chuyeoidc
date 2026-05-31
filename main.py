@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.1.1
+版本: v1.1.2
 """
 
 import asyncio
@@ -164,6 +164,14 @@ def escape_css_value(text: str) -> str:
     text = text.replace("'", "")
     text = text.replace('"', "")
     return text
+
+
+def normalize_percent(value, default: int = 100) -> int:
+    try:
+        percent = int(value)
+    except (TypeError, ValueError):
+        percent = default
+    return max(0, min(100, percent))
 
 
 def validate_url(url: str) -> bool:
@@ -875,10 +883,16 @@ class ConfigManager:
             "code_length": 6,
             "theme_color": "#50b6fe",
             "icon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
-            "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%BA%95.png",
+            "favicon_url": "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
+            "pc_wallpaper_url": "https://img.chuyel.top/api=srth453dfgh453tfgb45xdfg452b fg53b4nxf56g2",
+            "mobile_wallpaper_url": "https://img.chuyel.top/api=srth453dfgh453tfgb45xdfg452b fg53b4nxf56g2",
             "jwt_secret": "",  # JWT 签名密钥，留空则自动生成
             "public_url": "",  # 公共访问URL，用于OIDC issuer，如 https://example.com
             "ip_rate_limit": 0,
+            "pc_wallpaper_brightness": 100,
+            "mobile_wallpaper_brightness": 100,
+            "component_opacity": 70,
+            "default_group_hidden_message": "人数已满",
         }
 
         if os.path.exists(self.config_file):
@@ -936,6 +950,25 @@ class ClientManager:
             try:
                 with open(self.clients_file, encoding="utf-8") as f:
                     self._clients = json.load(f)
+                    need_save = False
+                    for cid, cdata in self._clients.items():
+                        if "verify_groups" not in cdata:
+                            old_id = cdata.get("verify_group_id", "")
+                            if old_id:
+                                cdata["verify_groups"] = [
+                                    {
+                                        "group_id": g.strip(),
+                                        "hidden": False,
+                                        "hidden_message": "",
+                                    }
+                                    for g in old_id.split(",")
+                                    if g.strip()
+                                ]
+                            else:
+                                cdata["verify_groups"] = []
+                            need_save = True
+                    if need_save:
+                        self._save_clients()
                     logger.info(
                         f"OIDC客户端配置加载成功，共 {len(self._clients)} 个客户端"
                     )
@@ -985,9 +1018,22 @@ class ClientManager:
         enable_private_verify: bool = True,
         verify_group_id: str = "",
         verify_success_message: str = "",
+        verify_groups: list = None,
     ) -> bool:
         if client_id in self._clients:
             return False
+        if verify_groups is None:
+            verify_groups = []
+            if verify_group_id:
+                verify_groups = [
+                    {
+                        "group_id": g.strip(),
+                        "hidden": False,
+                        "hidden_message": "",
+                    }
+                    for g in verify_group_id.split(",")
+                    if g.strip()
+                ]
         self._clients[client_id] = {
             "client_id": client_id,
             "client_secret": client_secret,
@@ -998,6 +1044,7 @@ class ClientManager:
             "enable_group_verify": enable_group_verify,
             "enable_private_verify": enable_private_verify,
             "verify_group_id": verify_group_id,
+            "verify_groups": verify_groups,
             "verify_success_message": verify_success_message,
             "created_at": time.time(),
         }
@@ -1015,6 +1062,7 @@ class ClientManager:
         enable_private_verify: bool = None,
         verify_group_id: str = None,
         verify_success_message: str = None,
+        verify_groups: list = None,
     ) -> bool:
         if client_id not in self._clients:
             return False
@@ -1036,6 +1084,16 @@ class ClientManager:
             self._clients[client_id]["home_urls"] = home_urls
         if redirect_urls is not None:
             self._clients[client_id]["redirect_urls"] = redirect_urls
+        if verify_groups is not None:
+            self._clients[client_id]["verify_groups"] = verify_groups
+            group_ids = [
+                g.get("group_id", "")
+                for g in verify_groups
+                if g.get("group_id")
+            ]
+            self._clients[client_id]["verify_group_id"] = ",".join(
+                group_ids
+            )
         return self._save_clients()
 
     def verify_redirect_uri(self, client_id: str, redirect_uri: str) -> bool:
@@ -1995,6 +2053,35 @@ class WebHandler:
     def _get_web_config(self, key: str, default=None):
         return self.config_manager.get(key, default)
 
+    def _css_url(self, url: str) -> str:
+        return (
+            str(url or "")
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\n", "")
+            .replace("\r", "")
+        )
+
+    def _get_wallpaper_values(self) -> dict:
+        pc_url = self._get_web_config("pc_wallpaper_url", "")
+        mobile_url = self._get_web_config("mobile_wallpaper_url", "")
+        pc_brightness = normalize_percent(
+            self._get_web_config("pc_wallpaper_brightness", 100), 100
+        )
+        mobile_brightness = normalize_percent(
+            self._get_web_config("mobile_wallpaper_brightness", 100), 100
+        )
+        component_opacity = normalize_percent(
+            self._get_web_config("component_opacity", 70), 70
+        )
+        return {
+            "pc_wallpaper_url": self._css_url(pc_url),
+            "mobile_wallpaper_url": self._css_url(mobile_url or pc_url),
+            "pc_wallpaper_brightness": pc_brightness,
+            "mobile_wallpaper_brightness": mobile_brightness,
+            "component_opacity": component_opacity / 100,
+        }
+
     def _is_password_hashed(self, password: str) -> bool:
         """检查密码是否已哈希
 
@@ -2188,7 +2275,12 @@ class WebHandler:
             "favicon_url",
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
         )
-        html = self._render_login_page(theme_color, icon_url, favicon_url)
+        html = self._render_login_page(
+            theme_color,
+            icon_url,
+            favicon_url,
+            **self._get_wallpaper_values(),
+        )
         return web.Response(text=html, content_type="text/html", charset="utf-8")
 
     async def handle_api_login(self, request: web.Request) -> web.Response:
@@ -2304,6 +2396,9 @@ class WebHandler:
                 "enable_private_verify", True
             ),
             "verify_group_id": self._get_web_config("verify_group_id", ""),
+            "default_group_hidden_message": self._get_web_config(
+                "default_group_hidden_message", "人数已满"
+            ),
             "code_expire_seconds": self._get_web_config("code_expire_seconds", 300),
             "code_length": self._get_web_config("code_length", 6),
             "ip_rate_limit": self._get_web_config("ip_rate_limit", 0),
@@ -2318,6 +2413,15 @@ class WebHandler:
             "cdn_ip_method": self._get_web_config("cdn_ip_method", ""),
             "pc_wallpaper_url": self._get_web_config("pc_wallpaper_url", ""),
             "mobile_wallpaper_url": self._get_web_config("mobile_wallpaper_url", ""),
+            "pc_wallpaper_brightness": normalize_percent(
+                self._get_web_config("pc_wallpaper_brightness", 100), 100
+            ),
+            "mobile_wallpaper_brightness": normalize_percent(
+                self._get_web_config("mobile_wallpaper_brightness", 100), 100
+            ),
+            "component_opacity": normalize_percent(
+                self._get_web_config("component_opacity", 70), 70
+            ),
             "ip_headers": ip_headers,
             "current_ip": (
                 self.plugin._get_client_ip(request)
@@ -2420,12 +2524,24 @@ class WebHandler:
                 "cdn_ip_method",
                 "pc_wallpaper_url",
                 "mobile_wallpaper_url",
+                "pc_wallpaper_brightness",
+                "mobile_wallpaper_brightness",
+                "component_opacity",
+                "default_group_hidden_message",
             ]
 
             update_data = {}
+            percent_keys = {
+                "pc_wallpaper_brightness",
+                "mobile_wallpaper_brightness",
+                "component_opacity",
+            }
             for key in allowed_keys:
                 if key in data:
-                    update_data[key] = data[key]
+                    if key in percent_keys:
+                        update_data[key] = normalize_percent(data[key], 100)
+                    else:
+                        update_data[key] = data[key]
 
             if self.config_manager.update(update_data):
                 # 如果更新了IP速率限制，更新速率限制器
@@ -2507,12 +2623,26 @@ class WebHandler:
                 if not redirect_urls and client_data.get("redirect_url"):
                     redirect_urls = [client_data.get("redirect_url")]
 
+                verify_groups = client_data.get("verify_groups", [])
+                if not verify_groups:
+                    old_id = client_data.get("verify_group_id", "")
+                    if old_id:
+                        verify_groups = [
+                            {
+                                "group_id": g.strip(),
+                                "hidden": False,
+                                "hidden_message": "",
+                            }
+                            for g in old_id.split(",")
+                            if g.strip()
+                        ]
+
                 clients.append(
                     {
                         "client_id": client_id,
                         "client_secret": client_data.get(
                             "client_secret", ""
-                        ),  # 返回真实secret，方便管理
+                        ),
                         "name": client_data.get("name", client_id),
                         "icon_url": client_data.get("icon_url", ""),
                         "enable_group_verify": client_data.get(
@@ -2522,6 +2652,7 @@ class WebHandler:
                             "enable_private_verify", True
                         ),
                         "verify_group_id": client_data.get("verify_group_id", ""),
+                        "verify_groups": verify_groups,
                         "verify_success_message": client_data.get(
                             "verify_success_message", ""
                         ),
@@ -2555,6 +2686,7 @@ class WebHandler:
             enable_private_verify = data.get("enable_private_verify", True)
             verify_group_id = data.get("verify_group_id", "")
             verify_success_message = data.get("verify_success_message", "")
+            verify_groups = data.get("verify_groups", [])
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2565,11 +2697,15 @@ class WebHandler:
             if not name:
                 name = self.client_manager.generate_client_name()
 
-            # 兼容旧数据格式
             if not home_urls and data.get("home_url"):
                 home_urls = [data.get("home_url")]
             if not redirect_urls and data.get("redirect_url"):
                 redirect_urls = [data.get("redirect_url")]
+
+            if verify_groups:
+                verify_group_id = ",".join(
+                    g.get("group_id", "") for g in verify_groups if g.get("group_id")
+                )
 
             if self.client_manager.add_client(
                 client_id,
@@ -2582,6 +2718,7 @@ class WebHandler:
                 enable_private_verify,
                 verify_group_id,
                 verify_success_message,
+                verify_groups,
             ):
                 return web.json_response(
                     {
@@ -2595,6 +2732,7 @@ class WebHandler:
                             "enable_group_verify": enable_group_verify,
                             "enable_private_verify": enable_private_verify,
                             "verify_group_id": verify_group_id,
+                            "verify_groups": verify_groups,
                             "verify_success_message": verify_success_message,
                             "home_urls": home_urls,
                             "redirect_urls": redirect_urls,
@@ -2628,6 +2766,7 @@ class WebHandler:
             enable_private_verify = data.get("enable_private_verify")
             verify_group_id = data.get("verify_group_id")
             verify_success_message = data.get("verify_success_message")
+            verify_groups = data.get("verify_groups")
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
 
@@ -2636,7 +2775,6 @@ class WebHandler:
                     {"success": False, "message": "缺少 client_id"}, status=400
                 )
 
-            # 兼容旧数据格式
             if not home_urls and data.get("home_url"):
                 home_urls = [data.get("home_url")]
             if not redirect_urls and data.get("redirect_url"):
@@ -2653,6 +2791,7 @@ class WebHandler:
                 enable_private_verify,
                 verify_group_id,
                 verify_success_message,
+                verify_groups,
             ):
                 return web.json_response(
                     {
@@ -2664,6 +2803,7 @@ class WebHandler:
                             "name": name,
                             "home_urls": home_urls,
                             "redirect_urls": redirect_urls,
+                            "verify_groups": verify_groups or [],
                         },
                     }
                 )
@@ -3249,6 +3389,12 @@ class WebHandler:
         )
         theme_color_css = escape_css_value(theme_color)
         favicon_url_safe = escape_html_attr(favicon_url)
+        wallpaper_values = self._get_wallpaper_values()
+        pc_wallpaper_url = wallpaper_values["pc_wallpaper_url"]
+        mobile_wallpaper_url = wallpaper_values["mobile_wallpaper_url"]
+        pc_wallpaper_brightness = wallpaper_values["pc_wallpaper_brightness"]
+        mobile_wallpaper_brightness = wallpaper_values["mobile_wallpaper_brightness"]
+        component_opacity = wallpaper_values["component_opacity"]
         icon_html = (
             f'<img src="{escape_html_attr(icon_url)}" class="w-16 h-16 object-cover rounded-2xl" alt="icon">'
             if icon_url
@@ -3264,12 +3410,18 @@ class WebHandler:
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root {{ --theme-color: {theme_color_css}; }}
-        body {{ background: linear-gradient(135deg, #f0f9ff 0%, #ffffff 45%, #eef8ff 100%); }}
+        body {{ background: #f8fafc; }}
+        body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{pc_wallpaper_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
+        body::after {{ content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(240, 249, 255, 0.24), rgba(255, 255, 255, 0.08), rgba(238, 248, 255, 0.2)); pointer-events: none; }}
+        .glass-panel {{ background: rgba(255, 255, 255, {component_opacity}); backdrop-filter: blur(18px); }}
+        @media (max-width: 768px) {{
+            body::before {{ background-image: url('{mobile_wallpaper_url}'); filter: brightness({mobile_wallpaper_brightness}%); }}
+        }}
     </style>
 </head>
 <body class="min-h-screen flex items-center justify-center px-6 py-10 text-slate-800">
     <div class="w-full max-w-xl flex flex-col items-center">
-        <main class="bg-white/90 backdrop-blur rounded-[2rem] shadow-2xl shadow-sky-100 border border-white p-8 sm:p-10">
+        <main class="glass-panel rounded-[2rem] shadow-2xl shadow-sky-100 border border-white p-8 sm:p-10">
         <div class="flex flex-col items-center text-center gap-5">
             <div class="text-[var(--theme-color)] bg-sky-50 rounded-3xl p-4">{icon_html}</div>
             <div>
@@ -3305,7 +3457,15 @@ class WebHandler:
         )
 
     def _render_login_page(
-        self, theme_color: str = "#50b6fe", icon_url: str = "", favicon_url: str = ""
+        self,
+        theme_color: str = "#50b6fe",
+        icon_url: str = "",
+        favicon_url: str = "",
+        pc_wallpaper_url: str = "",
+        mobile_wallpaper_url: str = "",
+        pc_wallpaper_brightness: int = 100,
+        mobile_wallpaper_brightness: int = 100,
+        component_opacity: float = 1,
     ) -> str:
         # 安全处理 icon_html，转义 URL
         icon_html = (
@@ -3320,6 +3480,11 @@ class WebHandler:
             theme_color=theme_color,
             icon_html=icon_html,
             favicon_url=favicon_url,
+            pc_wallpaper_url=pc_wallpaper_url,
+            mobile_wallpaper_url=mobile_wallpaper_url,
+            pc_wallpaper_brightness=pc_wallpaper_brightness,
+            mobile_wallpaper_brightness=mobile_wallpaper_brightness,
+            component_opacity=component_opacity,
         )
 
     def _render_admin_page(
@@ -3354,6 +3519,12 @@ class WebHandler:
         theme_color_js = escape_js_string(theme_color)
         theme_color_css = escape_css_value(theme_color)
         favicon_url_safe = escape_html_attr(favicon_url)
+        wallpaper_values = self._get_wallpaper_values()
+        pc_wallpaper_url = wallpaper_values["pc_wallpaper_url"]
+        mobile_wallpaper_url = wallpaper_values["mobile_wallpaper_url"]
+        pc_wallpaper_brightness = wallpaper_values["pc_wallpaper_brightness"]
+        mobile_wallpaper_brightness = wallpaper_values["mobile_wallpaper_brightness"]
+        component_opacity = wallpaper_values["component_opacity"]
 
         # 获取自定义字体设置
         custom_font_url = self._get_web_config("custom_font_url", "")
@@ -3387,9 +3558,17 @@ class WebHandler:
         }}
     </script>
     <style>
-        body {{ font-family: {custom_font_family}; }}
-        .glass {{ background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(12px); }}
-        .tab-active {{ color: {theme_color_css}; border-bottom: 2px solid {theme_color_css}; }}
+        html {{ overflow-y: scroll; scrollbar-gutter: stable; }}
+        body {{ font-family: {custom_font_family}; overflow-x: hidden; }}
+        body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{pc_wallpaper_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
+        body::after {{ content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(238, 242, 255, 0.22), rgba(248, 250, 252, 0.08), rgba(240, 253, 250, 0.18)); pointer-events: none; }}
+        .glass {{ background: rgba(255, 255, 255, {component_opacity}); backdrop-filter: blur(18px); }}
+        .bg-white {{ background-color: rgba(255, 255, 255, {component_opacity}) !important; backdrop-filter: blur(18px); }}
+        .tab-nav {{ background: rgba(255, 255, 255, {component_opacity}); backdrop-filter: blur(18px); border: 1px solid rgba(255, 255, 255, 0.55); box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08); }}
+        .tab {{ position: relative; border-radius: 1.25rem; color: #64748b; background: transparent; transform: translateY(0); transition: color 220ms ease, background-color 220ms ease, box-shadow 220ms ease, transform 220ms ease; }}
+        .tab:hover {{ color: {theme_color_css}; background: rgba(255, 255, 255, 0.46); box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06); transform: translateY(-1px); }}
+        .tab-active {{ color: {theme_color_css}; background: rgba(255, 255, 255, 0.72); box-shadow: 0 12px 30px {theme_color_css}26; }}
+        .tab-active svg {{ filter: drop-shadow(0 4px 8px {theme_color_css}30); }}
         .custom-scrollbar::-webkit-scrollbar {{ width: 6px; }}
         .custom-scrollbar::-webkit-scrollbar-track {{ background: transparent; }}
         .custom-scrollbar::-webkit-scrollbar-thumb {{ background: #e2e8f0; border-radius: 10px; }}
@@ -3400,13 +3579,16 @@ class WebHandler:
         .border-primary {{ border-color: {theme_color_css}; }}
         .shadow-primary {{ box-shadow: 0 10px 15px -3px {theme_color_css}33; }}
         .hover\:bg-primary:hover {{ background-color: {theme_color_css}; }}
-        .tab-content {{ display: none; }}
+        .tab-content {{ display: none; opacity: 0; transform: translateX(18px); transition: opacity 260ms ease, transform 260ms cubic-bezier(0.22, 1, 0.36, 1); }}
+        .tab-content.tab-content-left {{ transform: translateX(-18px); }}
+        .tab-content.tab-content-active {{ opacity: 1; transform: translateX(0); }}
         @media (max-width: 768px) {{
+            body::before {{ background-image: url('{mobile_wallpaper_url}'); filter: brightness({mobile_wallpaper_brightness}%); }}
             .mobile-scale {{ transform: scale(0.95); transform-origin: top center; }}
         }}
     </style>
 </head>
-<body class="bg-slate-50 text-slate-900 min-h-screen bg-[radial-gradient(circle_at_top_right,_var(--tw-gradient-stops))] from-indigo-50 via-slate-50 to-slate-50">
+<body class="bg-slate-50 text-slate-900 min-h-screen">
     <nav class="glass sticky top-0 z-50 border-b border-white/50 px-6 py-4">
         <div class="max-w-6xl mx-auto flex items-center justify-between">
             <div class="flex items-center gap-3">
@@ -3430,15 +3612,15 @@ class WebHandler:
     <main class="max-w-6xl mx-auto px-6 py-8 mobile-scale">
         {warning_html}
 
-        <div class="flex gap-4 md:gap-8 mb-8 border-b border-slate-200 overflow-x-auto whitespace-nowrap pb-1 scrollbar-hide">
-            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all tab-active flex items-center gap-2 whitespace-nowrap" data-tab="info">
+        <div class="tab-nav flex gap-2 md:gap-3 mb-8 overflow-x-auto whitespace-nowrap p-2 rounded-[1.75rem] scrollbar-hide">
+            <button class="tab px-4 md:px-5 py-3 text-sm font-bold tab-active flex items-center gap-2 whitespace-nowrap" data-tab="info">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 <span class="hidden md:inline">服务信息</span>
                 <span class="md:hidden">信息</span>
             </button>
-            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="config">
+            <button class="tab px-4 md:px-5 py-3 text-sm font-bold flex items-center gap-2 whitespace-nowrap" data-tab="config">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
@@ -3446,14 +3628,14 @@ class WebHandler:
                 <span class="hidden md:inline">配置设置</span>
                 <span class="md:hidden">配置</span>
             </button>
-            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="sessions">
+            <button class="tab px-4 md:px-5 py-3 text-sm font-bold flex items-center gap-2 whitespace-nowrap" data-tab="sessions">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
                 </svg>
                 <span class="hidden md:inline">认证会话</span>
                 <span class="md:hidden">会话</span>
             </button>
-            <button class="tab px-3 md:px-4 py-3 text-sm font-bold text-slate-500 hover:text-primary transition-all flex items-center gap-2 whitespace-nowrap" data-tab="clients">
+            <button class="tab px-4 md:px-5 py-3 text-sm font-bold flex items-center gap-2 whitespace-nowrap" data-tab="clients">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
                 </svg>
@@ -3462,7 +3644,7 @@ class WebHandler:
             </button>
         </div>
 
-        <div id="tab-info" class="tab-content space-y-8" style="display: block;">
+        <div id="tab-info" class="tab-content tab-content-active space-y-8" style="display: block;">
             <div class="grid md:grid-cols-2 gap-8">
                 <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
                     <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
@@ -3589,6 +3771,33 @@ class WebHandler:
                                 <p class="text-xs text-slate-500 mt-2">支持 http 地址或图床 API，建议尺寸 1080x1920</p>
                             </div>
 
+                            <div class="pt-4 border-t border-slate-100 space-y-5">
+                                <div>
+                                    <div class="flex items-center justify-between mb-2">
+                                        <label class="block text-sm font-bold text-slate-700">PC 端背景亮度</label>
+                                        <span id="pcWallpaperBrightnessValue" class="px-3 py-1 bg-primary/10 text-primary rounded-full text-xs font-bold">100%</span>
+                                    </div>
+                                    <input type="range" id="pcWallpaperBrightness" min="0" max="100" value="100" class="w-full accent-primary" oninput="updateRangeValue('pcWallpaperBrightness', 'pcWallpaperBrightnessValue')">
+                                    <p class="text-xs text-slate-500 mt-2">0% 最暗，100% 保持原图亮度</p>
+                                </div>
+                                <div>
+                                    <div class="flex items-center justify-between mb-2">
+                                        <label class="block text-sm font-bold text-slate-700">手机端背景亮度</label>
+                                        <span id="mobileWallpaperBrightnessValue" class="px-3 py-1 bg-primary/10 text-primary rounded-full text-xs font-bold">100%</span>
+                                    </div>
+                                    <input type="range" id="mobileWallpaperBrightness" min="0" max="100" value="100" class="w-full accent-primary" oninput="updateRangeValue('mobileWallpaperBrightness', 'mobileWallpaperBrightnessValue')">
+                                    <p class="text-xs text-slate-500 mt-2">单独控制手机端背景亮度，避免背景泛白</p>
+                                </div>
+                                <div>
+                                    <div class="flex items-center justify-between mb-2">
+                                        <label class="block text-sm font-bold text-slate-700">组件不透明度</label>
+                                        <span id="componentOpacityValue" class="px-3 py-1 bg-primary/10 text-primary rounded-full text-xs font-bold">70%</span>
+                                    </div>
+                                    <input type="range" id="componentOpacity" min="0" max="100" value="70" class="w-full accent-primary" oninput="updateRangeValue('componentOpacity', 'componentOpacityValue')">
+                                    <p class="text-xs text-slate-500 mt-2">100% 为实心组件，数值越低越接近透明毛玻璃效果</p>
+                                </div>
+                            </div>
+
                             <!-- 字体设置 -->
                             <div class="pt-4 border-t border-slate-100">
                                 <label class="block text-sm font-bold text-slate-700 mb-2">自定义字体 URL</label>
@@ -3636,6 +3845,11 @@ class WebHandler:
                             <div>
                                 <label class="block text-sm font-bold text-slate-700 mb-2">接收验证码的群号</label>
                                 <input type="text" id="verifyGroupId" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="多个群号用英文逗号分隔">
+                            </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">默认群号隐藏话语</label>
+                                <input type="text" id="defaultGroupHiddenMessage" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="人数已满">
+                                <p class="text-xs text-slate-500 mt-2">客户端群聊设置隐藏群号时，未单独配置隐藏话语则使用此默认值</p>
                             </div>
                             <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
                                 <div>
@@ -3779,18 +3993,25 @@ class WebHandler:
                             </div>
                         </div>
 
-                        <div class="grid md:grid-cols-2 gap-4 md:col-span-2">
-                            <div>
-                                <label class="block text-sm font-bold text-slate-700 mb-2">接收验证码的群号</label>
-                                <input type="text" id="clientVerifyGroupId" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="多个群号用英文逗号分隔，留空使用全局设置">
-                                <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的群号</p>
+                        <div class="md:col-span-2 pt-4 border-t border-slate-100">
+                            <div class="flex items-center justify-between mb-4">
+                                <h3 class="text-sm font-bold text-slate-700">群聊管理</h3>
+                                <button onclick="addGroupEntry()" class="px-4 py-2 bg-primary/10 text-primary hover:bg-primary/20 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                                    </svg>
+                                    添加群聊
+                                </button>
                             </div>
+                            <div id="verifyGroupsContainer" class="space-y-3">
+                            </div>
+                            <p class="text-xs text-slate-500 mt-3">添加接收验证码的群聊，可单独设置是否隐藏群号及隐藏时显示的话语</p>
+                        </div>
 
-                            <div>
-                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
-                                <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。留空使用全局设置"></textarea>
-                                <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证成功消息</p>
-                            </div>
+                        <div class="md:col-span-2">
+                            <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
+                            <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。留空使用全局设置"></textarea>
+                            <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证成功消息</p>
                         </div>
 
                         <div class="grid md:grid-cols-2 gap-4 md:col-span-2">
@@ -3888,17 +4109,33 @@ class WebHandler:
         console.log('页面初始化, basePath:', basePath);
         if (!token) {{ window.location.href = basePath + 'login'; }}
 
-        document.querySelectorAll('.tab').forEach(tab => {{
+        const tabs = Array.from(document.querySelectorAll('.tab'));
+        tabs.forEach(tab => {{
             tab.addEventListener('click', () => {{
                 console.log('点击标签:', tab.dataset.tab);
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('tab-active'));
+                if (tab.classList.contains('tab-active')) {{
+                    return;
+                }}
+                const currentTab = document.querySelector('.tab.tab-active');
+                const currentIndex = tabs.indexOf(currentTab);
+                const nextIndex = tabs.indexOf(tab);
+                const slideFromLeft = nextIndex < currentIndex;
+                tabs.forEach(t => t.classList.remove('tab-active'));
+                const tabContent = document.getElementById('tab-' + tab.dataset.tab);
                 document.querySelectorAll('.tab-content').forEach(c => {{
-                    c.style.display = 'none';
+                    c.classList.remove('tab-content-active');
+                    if (c !== tabContent) {{
+                        c.style.display = 'none';
+                    }}
                 }});
                 tab.classList.add('tab-active');
-                const tabContent = document.getElementById('tab-' + tab.dataset.tab);
                 if (tabContent) {{
+                    tabContent.classList.toggle('tab-content-left', slideFromLeft);
                     tabContent.style.display = 'block';
+                    void tabContent.offsetHeight;
+                    requestAnimationFrame(() => {{
+                        tabContent.classList.add('tab-content-active');
+                    }});
                     console.log('显示标签内容:', tab.dataset.tab);
                 }} else {{
                     console.error('找不到标签内容:', 'tab-' + tab.dataset.tab);
@@ -3916,6 +4153,14 @@ class WebHandler:
                 toast.style.transform = 'translateY(20px)';
                 toast.style.opacity = '0';
             }}, 3000);
+        }}
+
+        function updateRangeValue(inputId, valueId) {{
+            const input = document.getElementById(inputId);
+            const value = document.getElementById(valueId);
+            if (input && value) {{
+                value.textContent = input.value + '%';
+            }}
         }}
 
         async function loadConfig() {{
@@ -3943,6 +4188,7 @@ class WebHandler:
                 document.getElementById('enableGroupVerify').checked = config.enable_group_verify !== false;
                 document.getElementById('enablePrivateVerify').checked = config.enable_private_verify !== false;
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
+                document.getElementById('defaultGroupHiddenMessage').value = config.default_group_hidden_message || '人数已满';
                 document.getElementById('verifySuccessMessage').value = config.verify_success_message || '';
 
                 const themeColor = config.theme_color || '#50b6fe';
@@ -3955,6 +4201,12 @@ class WebHandler:
                 document.getElementById('customFontUrl').value = config.custom_font_url || '';
                 document.getElementById('pcWallpaperUrl').value = config.pc_wallpaper_url || '';
                 document.getElementById('mobileWallpaperUrl').value = config.mobile_wallpaper_url || '';
+                document.getElementById('pcWallpaperBrightness').value = config.pc_wallpaper_brightness ?? 100;
+                document.getElementById('mobileWallpaperBrightness').value = config.mobile_wallpaper_brightness ?? 100;
+                document.getElementById('componentOpacity').value = config.component_opacity ?? 70;
+                updateRangeValue('pcWallpaperBrightness', 'pcWallpaperBrightnessValue');
+                updateRangeValue('mobileWallpaperBrightness', 'mobileWallpaperBrightnessValue');
+                updateRangeValue('componentOpacity', 'componentOpacityValue');
 
                 // 更新CDN IP方式下拉菜单，显示当前IP
                 const cdnIpSelect = document.getElementById('cdnIpMethod');
@@ -4013,6 +4265,7 @@ class WebHandler:
                 enable_group_verify: document.getElementById('enableGroupVerify').checked,
                 enable_private_verify: document.getElementById('enablePrivateVerify').checked,
                 verify_group_id: document.getElementById('verifyGroupId').value,
+                default_group_hidden_message: document.getElementById('defaultGroupHiddenMessage').value,
                 verify_success_message: document.getElementById('verifySuccessMessage').value,
                 theme_color: document.getElementById('themeColor').value,
                 icon_url: document.getElementById('iconUrl').value,
@@ -4020,7 +4273,10 @@ class WebHandler:
                 custom_font_url: document.getElementById('customFontUrl').value,
                 cdn_ip_method: document.getElementById('cdnIpMethod').value,
                 pc_wallpaper_url: document.getElementById('pcWallpaperUrl').value,
-                mobile_wallpaper_url: document.getElementById('mobileWallpaperUrl').value
+                mobile_wallpaper_url: document.getElementById('mobileWallpaperUrl').value,
+                pc_wallpaper_brightness: parseInt(document.getElementById('pcWallpaperBrightness').value),
+                mobile_wallpaper_brightness: parseInt(document.getElementById('mobileWallpaperBrightness').value),
+                component_opacity: parseInt(document.getElementById('componentOpacity').value)
             }};
 
             try {{
@@ -4175,7 +4431,7 @@ class WebHandler:
                         <td class="px-6 py-4 text-sm text-slate-400 font-medium">${{new Date(c.created_at * 1000).toLocaleString()}}</td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.enable_group_verify)}}, ${{JSON.stringify(c.enable_private_verify)}}, ${{JSON.stringify(c.verify_group_id || '')}}, ${{JSON.stringify(c.verify_success_message || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
+                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.enable_group_verify)}}, ${{JSON.stringify(c.enable_private_verify)}}, ${{JSON.stringify(c.verify_group_id || '')}}, ${{JSON.stringify(c.verify_success_message || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}}, ${{JSON.stringify(c.verify_groups || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
                                 <button onclick="deleteClient(${{JSON.stringify(c.client_id)}})" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
                             </div>
                         </td>
@@ -4242,6 +4498,11 @@ class WebHandler:
             document.getElementById('newClientName').value = '';
             document.getElementById('newClientId').value = '';
             document.getElementById('newClientSecret').value = '';
+            document.getElementById('newClientIconUrl').value = '';
+            document.getElementById('clientEnableGroupVerify').checked = true;
+            document.getElementById('clientEnablePrivateVerify').checked = true;
+            document.getElementById('clientVerifySuccessMessage').value = '';
+            document.getElementById('verifyGroupsContainer').innerHTML = '';
             document.getElementById('homeUrlsContainer').innerHTML = `
                 <div class="flex items-center gap-2">
                     <input type="text" class="home-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com">
@@ -4252,11 +4513,64 @@ class WebHandler:
                     <input type="text" class="redirect-url-input w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/oauth/callback">
                 </div>
             `;
-            document.getElementById('addClientBtn').textContent = '添加客户端';
+            document.getElementById('addClientBtn').innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg> 添加客户端`;
             document.getElementById('cancelEditBtn').classList.add('hidden');
         }}
 
-        function editClient(clientId, name, clientSecret, iconUrl, enableGroupVerify, enablePrivateVerify, verifyGroupId, verifySuccessMessage, homeUrls, redirectUrls) {{
+        function addGroupEntry(groupId, hidden, hiddenMessage) {{
+            const container = document.getElementById('verifyGroupsContainer');
+            const entryId = 'group-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5);
+            const div = document.createElement('div');
+            div.id = entryId;
+            div.className = 'p-4 bg-slate-50 rounded-2xl border border-slate-100 space-y-3';
+            const safeGroupId = escapeHtml(groupId || '');
+            const safeHiddenMsg = escapeHtml(hiddenMessage || '');
+            div.innerHTML = `
+                <div class="flex items-center gap-3">
+                    <div class="flex-1">
+                        <input type="text" class="group-id-input w-full px-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none text-sm" placeholder="输入群号" value="${{safeGroupId}}">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs font-bold text-slate-500">隐藏群号</span>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" class="group-hidden-toggle sr-only peer" ${{hidden ? 'checked' : ''}} onchange="toggleGroupHiddenMsg(this)">
+                            <div class="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-primary"></div>
+                        </label>
+                    </div>
+                    <button onclick="document.getElementById('${{entryId}}').remove()" class="px-2 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl transition-all" title="删除">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+                <div class="group-hidden-msg-section ${{hidden ? '' : 'hidden'}}">
+                    <input type="text" class="group-hidden-msg-input w-full px-4 py-2.5 bg-white border border-slate-200 rounded-xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none text-sm" placeholder="隐藏时显示的话语（留空使用全局默认）" value="${{safeHiddenMsg}}">
+                </div>
+            `;
+            container.appendChild(div);
+        }}
+
+        function toggleGroupHiddenMsg(checkbox) {{
+            const entry = checkbox.closest('.space-y-3');
+            const msgSection = entry.querySelector('.group-hidden-msg-section');
+            if (checkbox.checked) {{
+                msgSection.classList.remove('hidden');
+            }} else {{
+                msgSection.classList.add('hidden');
+            }}
+        }}
+
+        function getVerifyGroups() {{
+            const entries = document.querySelectorAll('#verifyGroupsContainer > div');
+            return Array.from(entries).map(entry => {{
+                const groupId = entry.querySelector('.group-id-input').value.trim();
+                const hidden = entry.querySelector('.group-hidden-toggle').checked;
+                const hiddenMessage = entry.querySelector('.group-hidden-msg-input').value.trim();
+                return {{ group_id: groupId, hidden: hidden, hidden_message: hiddenMessage }};
+            }}).filter(g => g.group_id);
+        }}
+
+        function editClient(clientId, name, clientSecret, iconUrl, enableGroupVerify, enablePrivateVerify, verifyGroupId, verifySuccessMessage, homeUrls, redirectUrls, verifyGroups) {{
             editingClientId = clientId;
             document.getElementById('newClientName').value = name || '';
             document.getElementById('newClientId').value = clientId || '';
@@ -4264,8 +4578,14 @@ class WebHandler:
             document.getElementById('newClientIconUrl').value = iconUrl || '';
             document.getElementById('clientEnableGroupVerify').checked = enableGroupVerify !== false;
             document.getElementById('clientEnablePrivateVerify').checked = enablePrivateVerify !== false;
-            document.getElementById('clientVerifyGroupId').value = verifyGroupId || '';
             document.getElementById('clientVerifySuccessMessage').value = verifySuccessMessage || '';
+
+            // 设置群聊列表
+            const groupsContainer = document.getElementById('verifyGroupsContainer');
+            groupsContainer.innerHTML = '';
+            if (verifyGroups && verifyGroups.length > 0) {{
+                verifyGroups.forEach(g => addGroupEntry(g.group_id || '', g.hidden || false, g.hidden_message || ''));
+            }}
 
             // 设置主页链接
             const homeUrlsContainer = document.getElementById('homeUrlsContainer');
@@ -4285,7 +4605,7 @@ class WebHandler:
                 addRedirectUrlInput();
             }}
 
-            document.getElementById('addClientBtn').textContent = '更新客户端';
+            document.getElementById('addClientBtn').innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg> 更新客户端`;
             document.getElementById('cancelEditBtn').classList.remove('hidden');
 
             // 滚动到表单
@@ -4299,8 +4619,9 @@ class WebHandler:
             const icon_url = document.getElementById('newClientIconUrl').value;
             const enable_group_verify = document.getElementById('clientEnableGroupVerify').checked;
             const enable_private_verify = document.getElementById('clientEnablePrivateVerify').checked;
-            const verify_group_id = document.getElementById('clientVerifyGroupId').value;
             const verify_success_message = document.getElementById('clientVerifySuccessMessage').value;
+            const verify_groups = getVerifyGroups();
+            const verify_group_id = verify_groups.map(g => g.group_id).join(',');
             const home_urls = getHomeUrls();
             const redirect_urls = getRedirectUrls();
 
@@ -4333,6 +4654,7 @@ class WebHandler:
                         enable_group_verify: enable_group_verify,
                         enable_private_verify: enable_private_verify,
                         verify_group_id: verify_group_id,
+                        verify_groups: verify_groups,
                         verify_success_message: verify_success_message,
                         home_urls: home_urls,
                         redirect_urls: redirect_urls
@@ -4512,8 +4834,31 @@ class WebHandler:
 
         group_info = ""
         if enable_group_verify and verify_group_id:
-            groups = [g.strip() for g in verify_group_id.split(",") if g.strip()]
-            if groups:
+            verify_groups = []
+            if client:
+                verify_groups = client.get("verify_groups", [])
+            if not verify_groups:
+                groups = [
+                    g.strip() for g in verify_group_id.split(",") if g.strip()
+                ]
+                verify_groups = [
+                    {"group_id": g, "hidden": False, "hidden_message": ""}
+                    for g in groups
+                ]
+            default_hidden_msg = self._get_web_config(
+                "default_group_hidden_message", "人数已满"
+            )
+            display_parts = []
+            for g in verify_groups:
+                gid = g.get("group_id", "")
+                if not gid:
+                    continue
+                if g.get("hidden", False):
+                    msg = g.get("hidden_message", "") or default_hidden_msg
+                    display_parts.append(escape_html(msg))
+                else:
+                    display_parts.append(escape_html(gid))
+            if display_parts:
                 group_info = f"""
                 <div class="flex items-start gap-3 p-4 bg-primary/5 rounded-2xl border border-primary/10">
                     <div class="bg-primary p-1.5 rounded-lg text-white">
@@ -4523,7 +4868,7 @@ class WebHandler:
                     </div>
                     <div>
                         <p class="text-xs font-bold text-primary uppercase tracking-wider mb-1">发送到群聊</p>
-                        <p class="text-sm font-medium text-slate-700">{escape_html(", ".join(groups))}</p>
+                        <p class="text-sm font-medium text-slate-700">{", ".join(display_parts)}</p>
                     </div>
                 </div>"""
 
@@ -4547,6 +4892,8 @@ class WebHandler:
             [f'<span class="code-char">{escape_html(char)}</span>' for char in code]
         )
 
+        wallpaper_values = self._get_wallpaper_values()
+
         # 从模板文件加载
         try:
             return template_manager.render(
@@ -4566,6 +4913,7 @@ class WebHandler:
                 private_info=private_info,
                 custom_font_link=custom_font_link,
                 custom_font_family=custom_font_family,
+                **wallpaper_values,
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}，使用内置模板")
@@ -4585,6 +4933,7 @@ class WebHandler:
                 private_info,
                 custom_font_link,
                 custom_font_family,
+                wallpaper_values,
             )
 
     def _render_verify_page_builtin(
@@ -4604,6 +4953,7 @@ class WebHandler:
         private_info: str,
         custom_font_link: str = "",
         custom_font_family: str = "'Inter', -apple-system, sans-serif",
+        wallpaper_values: dict = None,
     ) -> str:
         """内置验证页面模板（备用）
 
@@ -4615,8 +4965,9 @@ class WebHandler:
         try:
             from .templates import template_manager
 
-            template = template_manager.get_template("verify")
-            return template.format(
+            wallpaper_values = wallpaper_values or self._get_wallpaper_values()
+            return template_manager.render(
+                "verify",
                 theme_color=escape_css_value(theme_color),
                 icon_html=icon_html,
                 favicon_url=escape_html_attr(favicon_url),
@@ -4632,6 +4983,7 @@ class WebHandler:
                 private_info=private_info,
                 custom_font_link=custom_font_link,
                 custom_font_family=custom_font_family,
+                **wallpaper_values,
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}")
@@ -4658,14 +5010,17 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" /></svg>"""
         )
 
+        wallpaper_values = self._get_wallpaper_values()
+
         # 从模板文件加载
         try:
-            return template_manager.render(
-                "verify_input",
+            template = template_manager.get_template("verify_input")
+            return template.format(
                 theme_color=escape_css_value(theme_color),
                 icon_html=icon_html,
                 favicon_url=escape_html_attr(favicon_url),
                 code=escape_html(code),
+                **wallpaper_values,
             )
         except Exception as e:
             logger.error(f"加载模板失败: {e}，使用内置模板")
@@ -4826,6 +5181,9 @@ class ChuyeOIDCPlugin(Star):
         self.oidc_server: OIDCServer | None = None
         self.web_handler: WebHandler | None = None
         self._cleanup_task: asyncio.Task | None = None
+        self._web_app: web.Application | None = None
+        self._web_runner: web.AppRunner | None = None
+        self._web_site: web.TCPSite | None = None
 
     def _get_config(self, key: str, default=None):
         if not self.config:
@@ -4901,30 +5259,45 @@ class ChuyeOIDCPlugin(Star):
 
         app = web.Application()
         app.router.add_route("*", "/{path:.*}", self.web_handler.handle_root)
+        self._web_app = app
 
-        # 检查端口是否被占用，如果被占用则等待释放
         import socket
 
-        def is_port_in_use(port):
+        def can_bind_port(port: int) -> bool:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                return s.connect_ex(("0.0.0.0", port)) == 0
+                try:
+                    s.bind(("0.0.0.0", port))
+                    return True
+                except OSError:
+                    return False
 
-        max_wait = 10  # 最大等待10秒
+        max_wait = 15
         waited = 0
-        while is_port_in_use(port) and waited < max_wait:
+        while not can_bind_port(port) and waited < max_wait:
             logger.warning(f"端口 {port} 被占用，等待释放... ({waited + 1}/{max_wait})")
             await asyncio.sleep(1)
             waited += 1
 
-        if is_port_in_use(port):
+        if not can_bind_port(port):
             logger.error(f"端口 {port} 仍然被占用，无法启动服务")
+            await self._cleanup_web_server()
+            if self.oidc_server:
+                await self.oidc_server.stop_auto_save()
             raise OSError(f"端口 {port} 被占用")
 
         runner = web.AppRunner(app)
-        await runner.setup()
+        self._web_runner = runner
 
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
+        try:
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            self._web_site = site
+            await site.start()
+        except Exception:
+            await self._cleanup_web_server()
+            if self.oidc_server:
+                await self.oidc_server.stop_auto_save()
+            raise
 
         self.oidc_server.app = app
         self.oidc_server.runner = runner
@@ -4937,6 +5310,42 @@ class ChuyeOIDCPlugin(Star):
         logger.info(
             f"OIDC发现文档: http://localhost:{port}/.well-known/openid-configuration"
         )
+
+    async def _cleanup_web_server(self):
+        site = self._web_site
+        runner = self._web_runner
+
+        if not site and self.oidc_server:
+            site = self.oidc_server.site
+        if not runner and self.oidc_server:
+            runner = self.oidc_server.runner
+
+        if site:
+            try:
+                await site.stop()
+                logger.debug("Site 已停止")
+            except Exception as e:
+                logger.debug(f"停止 site 时出错（可能已停止）: {e}")
+
+        if runner:
+            try:
+                for runner_site in list(getattr(runner, "_sites", [])):
+                    try:
+                        await runner_site.stop()
+                    except Exception:
+                        pass
+                await runner.cleanup()
+                logger.debug("Runner 已清理")
+            except Exception as e:
+                logger.debug(f"清理 runner 时出错（可能已清理）: {e}")
+
+        if self.oidc_server:
+            self.oidc_server.site = None
+            self.oidc_server.runner = None
+            self.oidc_server.app = None
+        self._web_site = None
+        self._web_runner = None
+        self._web_app = None
 
     async def terminate(self):
         logger.info("OIDC登录插件正在停止...")
@@ -4958,37 +5367,10 @@ class ChuyeOIDCPlugin(Star):
             logger.info("会话数据已保存")
 
         # 停止 Web 服务（添加异常处理避免重启时出错）
-        if self.oidc_server:
-            try:
-                if self.oidc_server.site:
-                    await self.oidc_server.site.stop()
-                    logger.debug("Site 已停止")
-            except Exception as e:
-                logger.debug(f"停止 site 时出错（可能已停止）: {e}")
+        await self._cleanup_web_server()
 
-            try:
-                if self.oidc_server.runner:
-                    await self.oidc_server.runner.cleanup()
-                    logger.debug("Runner 已清理")
-            except Exception as e:
-                logger.debug(f"清理 runner 时出错（可能已清理）: {e}")
-
-            # 强制关闭所有连接，确保端口立即释放
-            try:
-                if self.oidc_server.app:
-                    # 关闭所有活跃的连接
-                    for site in list(getattr(self.oidc_server.runner, "_sites", [])):
-                        try:
-                            await site.stop()
-                        except Exception:
-                            pass
-            except Exception as e:
-                logger.debug(f"关闭连接时出错: {e}")
-
-            # 等待端口释放，避免重启时出现 "地址已被使用" 错误
-            # 需要足够长的时间让操作系统完全释放端口
-            logger.debug("等待端口释放...")
-            await asyncio.sleep(5)
+        # 给事件循环一次机会完成底层 socket 关闭，避免重载时端口短暂占用
+        await asyncio.sleep(0.5)
 
         logger.info("OIDC登录插件已停止")
 
