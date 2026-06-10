@@ -4,7 +4,7 @@ AstrBot OIDC 登录插件
 用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.1.2
+版本: v1.1.3
 """
 
 import asyncio
@@ -21,9 +21,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import jwt
+import aiohttp
 from aiohttp import web
 
 from astrbot.api import logger
@@ -1297,10 +1298,7 @@ class OIDCServer:
         """停止自动保存任务"""
         if self._save_task:
             self._save_task.cancel()
-            try:
-                await self._save_task
-            except asyncio.CancelledError:
-                pass
+            self._save_task = None
 
     async def save_all_data(self):
         """立即保存所有会话数据"""
@@ -1982,6 +1980,7 @@ class WebHandler:
         self.config_manager = config_manager
         self.client_manager = client_manager
         self.sessions: dict[str, dict] = {}
+        self._font_cache: dict[str, Any] = {}
         self._lock = asyncio.Lock()  # 用于保护会话操作
 
         # 速率限制告警回调函数
@@ -2058,10 +2057,7 @@ class WebHandler:
         """停止后台清理任务"""
         if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+        self._cleanup_task = None
 
     async def _validate_session(self, token: str) -> bool:
         """验证 session 是否有效（未过期）
@@ -2095,6 +2091,32 @@ class WebHandler:
             .replace("\n", "")
             .replace("\r", "")
         )
+
+    def _get_custom_font_assets(self) -> tuple[str, str]:
+        custom_font_url = self._get_web_config("custom_font_url", "")
+        if not custom_font_url:
+            return (
+                '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">',
+                "'Inter', -apple-system, sans-serif",
+            )
+
+        parsed_path = urlparse(custom_font_url).path.lower()
+        safe_url = escape_html_attr(custom_font_url)
+        font_family = "'Custom Font', -apple-system, sans-serif"
+        font_formats = {
+            ".woff2": "woff2",
+            ".woff": "woff",
+            ".ttf": "truetype",
+        }
+        for suffix, font_format in font_formats.items():
+            if parsed_path.endswith(suffix):
+                css_url = self._css_url("/assets/custom-font")
+                return (
+                    f"<style>@font-face {{ font-family: 'Custom Font'; src: url('{css_url}') format('{font_format}'); font-weight: normal; font-style: normal; font-display: swap; }} html, body, button, input, select, textarea {{ font-family: 'Custom Font', -apple-system, sans-serif !important; }}</style>",
+                    font_family,
+                )
+
+        return (f'<link href="{safe_url}" rel="stylesheet">', font_family)
 
     def _get_wallpaper_values(self) -> dict:
         pc_url = self._get_web_config("pc_wallpaper_url", "")
@@ -2220,8 +2242,8 @@ class WebHandler:
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' cdn.tailwindcss.com cdn.jsdelivr.net; "
-            "style-src 'self' 'unsafe-inline' fonts.googleapis.com cdn.jsdelivr.net; "
-            "font-src fonts.gstatic.com cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https:; "
+            "font-src 'self' data: https:; "
             "img-src 'self' data: https:; "
             "connect-src 'self'; "
             "frame-ancestors 'none'; "
@@ -2258,6 +2280,7 @@ class WebHandler:
                 f"{secure_path}/api/clients/add": self.handle_api_clients_add,
                 f"{secure_path}/api/clients/update": self.handle_api_clients_update,
                 f"{secure_path}/api/clients/delete": self.handle_api_clients_delete,
+                "assets/custom-font": self.handle_custom_font,
                 "authorize": self.handle_authorize,
                 "token": self.handle_token,
                 "userinfo": self.handle_userinfo,
@@ -2281,6 +2304,63 @@ class WebHandler:
                 {"error": "internal_server_error", "message": "服务器内部错误"},
                 status=500,
             )
+
+    async def handle_custom_font(self, request: web.Request) -> web.Response:
+        custom_font_url = self._get_web_config("custom_font_url", "")
+        parsed_path = urlparse(custom_font_url).path.lower()
+        content_types = {
+            ".woff2": "font/woff2",
+            ".woff": "font/woff",
+            ".ttf": "font/ttf",
+        }
+        content_type = ""
+        for suffix, mime in content_types.items():
+            if parsed_path.endswith(suffix):
+                content_type = mime
+                break
+        if not custom_font_url or not content_type:
+            return web.Response(status=404, text="Font not configured")
+
+        cached = self._font_cache.get(custom_font_url)
+        if cached:
+            return web.Response(
+                body=cached["body"],
+                content_type=cached["content_type"],
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                    "Access-Control-Allow-Origin": "*",
+                },
+            )
+
+        encoded_url = quote(custom_font_url, safe=":/?#[]@!$&'()*+,;=%")
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(encoded_url) as resp:
+                    if resp.status != 200:
+                        return web.Response(status=502, text="Font fetch failed")
+                    body = await resp.read()
+                    if not body:
+                        return web.Response(status=502, text="Font is empty")
+                    resp_content_type = resp.headers.get("Content-Type", "").split(";")[0]
+                    final_content_type = resp_content_type if resp_content_type.startswith("font/") else content_type
+                    self._font_cache = {
+                        custom_font_url: {
+                            "body": body,
+                            "content_type": final_content_type,
+                        }
+                    }
+                    return web.Response(
+                        body=body,
+                        content_type=final_content_type,
+                        headers={
+                            "Cache-Control": "public, max-age=3600",
+                            "Access-Control-Allow-Origin": "*",
+                        },
+                    )
+        except Exception as e:
+            logger.warning(f"字体代理加载失败: {e}")
+            return web.Response(status=502, text="Font fetch failed")
 
     async def handle_admin(self, request: web.Request) -> web.Response:
         is_default_password = self._check_password_default()
@@ -3512,6 +3592,8 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" style="width: 64px; height: 64px;" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>"""
         )
 
+        custom_font_link, custom_font_family = self._get_custom_font_assets()
+
         # 使用外置模板，直接传递原始值
         return template_manager.render(
             "login",
@@ -3523,6 +3605,8 @@ class WebHandler:
             pc_wallpaper_brightness=pc_wallpaper_brightness,
             mobile_wallpaper_brightness=mobile_wallpaper_brightness,
             component_opacity=component_opacity,
+            custom_font_link=custom_font_link,
+            custom_font_family=custom_font_family,
         )
 
     def _render_admin_page(
@@ -3565,15 +3649,7 @@ class WebHandler:
         component_opacity = wallpaper_values["component_opacity"]
 
         # 获取自定义字体设置
-        custom_font_url = self._get_web_config("custom_font_url", "")
-        if custom_font_url:
-            custom_font_link = (
-                f'<link href="{escape_html_attr(custom_font_url)}" rel="stylesheet">'
-            )
-            custom_font_family = "'Custom Font', -apple-system, sans-serif"
-        else:
-            custom_font_link = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
-            custom_font_family = "'Inter', -apple-system, sans-serif"
+        custom_font_link, custom_font_family = self._get_custom_font_assets()
 
         return rf"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3597,7 +3673,8 @@ class WebHandler:
     </script>
     <style>
         html {{ overflow-y: scroll; scrollbar-gutter: stable; }}
-        body {{ font-family: {custom_font_family}; overflow-x: hidden; }}
+        html, body, button, input, select, textarea {{ font-family: {custom_font_family} !important; }}
+        body {{ overflow-x: hidden; }}
         body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{pc_wallpaper_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
         body::after {{ content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(238, 242, 255, 0.22), rgba(248, 250, 252, 0.08), rgba(240, 253, 250, 0.18)); pointer-events: none; }}
         .glass {{ background: rgba(255, 255, 255, {component_opacity}); backdrop-filter: blur(18px); }}
@@ -3839,8 +3916,8 @@ class WebHandler:
                             <!-- 字体设置 -->
                             <div class="pt-4 border-t border-slate-100">
                                 <label class="block text-sm font-bold text-slate-700 mb-2">自定义字体 URL</label>
-                                <input type="text" id="customFontUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&display=swap">
-                                <p class="text-xs text-slate-500 mt-2">支持 Google Fonts 或其他 CDN 字体链接，留空使用系统默认字体</p>
+                                <input type="text" id="customFontUrl" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" placeholder="例如：https://example.com/font.woff 或 Google Fonts CSS 链接">
+                                <p class="text-xs text-slate-500 mt-2">支持 Google Fonts CSS 链接，也支持 woff、woff2、ttf 字体文件直链</p>
                             </div>
 
                             <!-- CDN获取IP方式 -->
@@ -4852,16 +4929,7 @@ class WebHandler:
             "https://cloud.chuyel.top/f/PkZsP/tu%E5%B7%B2%E5%8E%BB%E5%BA%95.png",
         )
         # 获取自定义字体设置
-        custom_font_url = self._get_web_config("custom_font_url", "")
-        if custom_font_url:
-            custom_font_link = (
-                f'<link href="{escape_html_attr(custom_font_url)}" rel="stylesheet">'
-            )
-            # 从URL中提取字体名称（简化处理）
-            custom_font_family = "'Custom Font', -apple-system, sans-serif"
-        else:
-            custom_font_link = '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">'
-            custom_font_family = "'Inter', -apple-system, sans-serif"
+        custom_font_link, custom_font_family = self._get_custom_font_assets()
 
         client_name = client.get("name", "未知应用") if client else "未知应用"
 
@@ -4936,7 +5004,12 @@ class WebHandler:
                     display_parts.append(escape_html(msg))
                 else:
                     display_parts.append(escape_html(gid))
-            if display_parts:
+            if verify_groups:
+                group_detail_html = (
+                    f'<p class="text-sm font-medium text-slate-700">{", ".join(display_parts)}</p>'
+                    if display_parts
+                    else ""
+                )
                 group_info = f"""
                 <div class="flex items-start gap-3 p-4 bg-primary/5 rounded-2xl border border-primary/10">
                     <div class="bg-primary p-1.5 rounded-lg text-white">
@@ -4946,7 +5019,7 @@ class WebHandler:
                     </div>
                     <div>
                         <p class="text-xs font-bold text-primary uppercase tracking-wider mb-1">发送到群聊</p>
-                        <p class="text-sm font-medium text-slate-700">{", ".join(display_parts)}</p>
+                        {group_detail_html}
                     </div>
                 </div>"""
 
@@ -4970,6 +5043,7 @@ class WebHandler:
             [f'<span class="code-char">{escape_html(char)}</span>' for char in code]
         )
 
+        custom_font_link, custom_font_family = self._get_custom_font_assets()
         wallpaper_values = self._get_wallpaper_values()
 
         # 从模板文件加载
@@ -5088,6 +5162,7 @@ class WebHandler:
             else """<svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" /></svg>"""
         )
 
+        custom_font_link, custom_font_family = self._get_custom_font_assets()
         wallpaper_values = self._get_wallpaper_values()
 
         # 从模板文件加载
@@ -5098,6 +5173,8 @@ class WebHandler:
                 icon_html=icon_html,
                 favicon_url=escape_html_attr(favicon_url),
                 code=escape_html(code),
+                custom_font_link=custom_font_link,
+                custom_font_family=custom_font_family,
                 **wallpaper_values,
             )
         except Exception as e:
@@ -5120,6 +5197,7 @@ class WebHandler:
         - 用户身份验证必须通过 QQ 消息（可信通道）完成
         - 不允许用户自填 user_id，防止身份伪造
         """
+        custom_font_link, custom_font_family = self._get_custom_font_assets()
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -5128,7 +5206,7 @@ class WebHandler:
     <title>OIDC 验证 - 验证码状态</title>
     <link rel="icon" type="image/png" href="{escape_html_attr(favicon_url)}">
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    {custom_font_link}
     <script>
         tailwind.config = {{
             theme: {{
@@ -5141,7 +5219,7 @@ class WebHandler:
         }}
     </script>
     <style>
-        body {{ font-family: 'Inter', -apple-system, sans-serif; }}
+        html, body, button, input, select, textarea {{ font-family: {custom_font_family} !important; }}
         .glass {{ background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }}
         .bg-primary {{ background-color: {escape_css_value(theme_color)}; }}
         .text-primary {{ color: {escape_css_value(theme_color)}; }}
@@ -5349,21 +5427,14 @@ class ChuyeOIDCPlugin(Star):
                 except OSError:
                     return False
 
-        max_wait = 15
-        waited = 0
-        while not can_bind_port(port) and waited < max_wait:
-            logger.warning(f"端口 {port} 被占用，等待释放... ({waited + 1}/{max_wait})")
-            await asyncio.sleep(1)
-            waited += 1
-
         if not can_bind_port(port):
-            logger.error(f"端口 {port} 仍然被占用，无法启动服务")
+            logger.error(f"端口 {port} 被占用，无法启动服务")
             await self._cleanup_web_server()
             if self.oidc_server:
                 await self.oidc_server.stop_auto_save()
             raise OSError(f"端口 {port} 被占用")
 
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, shutdown_timeout=0)
         self._web_runner = runner
 
         try:
@@ -5400,7 +5471,7 @@ class ChuyeOIDCPlugin(Star):
 
         if site:
             try:
-                await site.stop()
+                await asyncio.wait_for(site.stop(), timeout=1)
                 logger.debug("Site 已停止")
             except Exception as e:
                 logger.debug(f"停止 site 时出错（可能已停止）: {e}")
@@ -5409,10 +5480,11 @@ class ChuyeOIDCPlugin(Star):
             try:
                 for runner_site in list(getattr(runner, "_sites", [])):
                     try:
-                        await runner_site.stop()
+                        await asyncio.wait_for(runner_site.stop(), timeout=1)
                     except Exception:
                         pass
-                await runner.cleanup()
+                await asyncio.wait_for(runner.shutdown(), timeout=1)
+                await asyncio.wait_for(runner.cleanup(), timeout=1)
                 logger.debug("Runner 已清理")
             except Exception as e:
                 logger.debug(f"清理 runner 时出错（可能已清理）: {e}")
@@ -5434,21 +5506,16 @@ class ChuyeOIDCPlugin(Star):
 
         if self._cleanup_task:
             self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+            self._cleanup_task = None
 
-        # 保存所有会话数据
-        if hasattr(self, "session_manager") and self.session_manager:
-            await self.session_manager.save_all()
-            logger.info("会话数据已保存")
-
-        # 停止 Web 服务（添加异常处理避免重启时出错）
         await self._cleanup_web_server()
 
-        # 给事件循环一次机会完成底层 socket 关闭，避免重载时端口短暂占用
-        await asyncio.sleep(0.5)
+        if hasattr(self, "session_manager") and self.session_manager:
+            try:
+                await asyncio.wait_for(self.session_manager.save_all(), timeout=2)
+                logger.info("会话数据已保存")
+            except Exception as e:
+                logger.warning(f"停止时保存会话数据失败，已继续关闭: {e}")
 
         logger.info("OIDC登录插件已停止")
 

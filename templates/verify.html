@@ -19,7 +19,7 @@
         }
     </script>
     <style>
-        body { font-family: {{custom_font_family}}; }
+        html, body, button, input, select, textarea { font-family: {{custom_font_family}} !important; }
         body::before { content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{{pc_wallpaper_url}}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({{pc_wallpaper_brightness}}%); }
         body::after { content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(224, 231, 255, 0.22), rgba(248, 250, 252, 0.06), rgba(204, 251, 241, 0.2)); pointer-events: none; }
         .glass { background: rgba(255, 255, 255, {{component_opacity}}); backdrop-filter: blur(18px); }
