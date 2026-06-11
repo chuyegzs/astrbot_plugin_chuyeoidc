@@ -1,10 +1,10 @@
 """
-AstrBot OIDC 登录插件
+AstrBot AMiaoLoader 登录插件
 
-用于网站 OIDC 登录插件，让支持 OIDC 登录的程序支持 QQ 群聊/私聊登录。
+用于网站 AMiaoLoader 登录插件，让支持 AMiaoLoader 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.1.3
+版本: v1.1.4
 """
 
 import asyncio
@@ -173,6 +173,14 @@ def normalize_percent(value, default: int = 100) -> int:
     except (TypeError, ValueError):
         percent = default
     return max(0, min(100, percent))
+
+
+def normalize_non_negative_int(value, default: int = 0) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(0, number)
 
 
 def normalize_verify_groups(groups) -> list:
@@ -916,6 +924,7 @@ class ConfigManager:
             "mobile_wallpaper_brightness": 100,
             "component_opacity": 70,
             "default_group_hidden_message": "人数已满",
+            "verify_success_message": "验证成功！您已通过AMiaoLoader登录成功。",
         }
 
         if os.path.exists(self.config_file):
@@ -923,6 +932,13 @@ class ConfigManager:
                 with open(self.config_file, encoding="utf-8") as f:
                     loaded = json.load(f)
                     default_config.update(loaded)
+                    if (
+                        default_config.get("verify_success_message")
+                        == "验证成功！您已通过OIDC认证。"
+                    ):
+                        default_config["verify_success_message"] = (
+                            "验证成功！您已通过AMiaoLoader登录成功。"
+                        )
                     logger.info("Web配置加载成功")
             except Exception as e:
                 logger.error(f"加载Web配置失败: {e}")
@@ -1791,9 +1807,11 @@ class RateLimiter:
             window_size: 新的时间窗口大小
         """
         if max_attempts is not None:
-            self.max_attempts = max_attempts
+            self.max_attempts = normalize_non_negative_int(max_attempts, self.max_attempts)
         if window_size is not None:
-            self.window_size = window_size
+            self.window_size = normalize_non_negative_int(window_size, self.window_size)
+        self._attempts.clear()
+        self._lockouts.clear()
 
     def _get_key(self, identifier: str, ip: str = "") -> str:
         """生成唯一标识键"""
@@ -1989,11 +2007,16 @@ class WebHandler:
                 f"速率限制触发: 用户={identifier}, IP={ip}, 尝试次数={attempts}"
             )
 
+        ip_rate_limit = normalize_non_negative_int(
+            self._get_web_config("ip_rate_limit", 0), 0
+        )
+        effective_ip_rate_limit = 999999 if ip_rate_limit == 0 else ip_rate_limit
+
         # 初始化速率限制器
         self.rate_limiter = RateLimiter(
-            max_attempts=5,
+            max_attempts=max(5, effective_ip_rate_limit),
             lockout_duration=900,  # 15分钟
-            window_size=300,  # 5分钟
+            window_size=60,  # 1分钟
             on_rate_limit_triggered=on_rate_limit_triggered,
         )
 
@@ -2003,13 +2026,8 @@ class WebHandler:
         ):
             logger.warning(f"验证码验证速率限制触发: IP={ip}, 尝试次数={attempts}")
 
-        # 从配置读取 IP 速率限制，默认 0 表示无限制
-        ip_rate_limit = self._get_web_config("ip_rate_limit", 0)
-        if ip_rate_limit == 0:
-            ip_rate_limit = 999999  # 0表示无限制
-
         self.verify_rate_limiter = RateLimiter(
-            max_attempts=ip_rate_limit,  # 每个IP最多请求次数
+            max_attempts=effective_ip_rate_limit,  # 每个IP最多请求次数
             lockout_duration=300,  # 锁定5分钟
             window_size=60,  # 1分钟窗口
             on_rate_limit_triggered=on_verify_rate_limit_triggered,
@@ -2402,7 +2420,11 @@ class WebHandler:
             data = await request.json()
             username = data.get("username", "").strip()
             password = data.get("password", "")
-            ip = request.remote or ""
+            ip = (
+                self.plugin._get_client_ip(request)
+                if hasattr(self.plugin, "_get_client_ip")
+                else (request.remote or "")
+            )
 
             # 原子性地检查速率限制并记录尝试
             allowed, error_msg = await self.rate_limiter.check_and_record_limit(
@@ -2515,9 +2537,11 @@ class WebHandler:
             ),
             "code_expire_seconds": self._get_web_config("code_expire_seconds", 300),
             "code_length": self._get_web_config("code_length", 6),
-            "ip_rate_limit": self._get_web_config("ip_rate_limit", 0),
+            "ip_rate_limit": normalize_non_negative_int(
+                self._get_web_config("ip_rate_limit", 0), 0
+            ),
             "verify_success_message": self._get_web_config(
-                "verify_success_message", ""
+                "verify_success_message", "验证成功！您已通过AMiaoLoader登录成功。"
             ),
             "theme_color": self._get_web_config("theme_color", "#50b6fe"),
             "icon_url": self._get_web_config("icon_url", ""),
@@ -2579,10 +2603,18 @@ class WebHandler:
                         status=400,
                     )
 
-            # 验证单IP请求速率限制
             if "ip_rate_limit" in data:
-                value = data["ip_rate_limit"]
-                if not isinstance(value, int) or value < 0 or (0 < value < 30):
+                try:
+                    value = int(data["ip_rate_limit"])
+                except (TypeError, ValueError):
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "message": "单IP请求速率限制必须为 0 或大于等于 30",
+                        },
+                        status=400,
+                    )
+                if value < 0 or (0 < value < 30):
                     return web.json_response(
                         {
                             "success": False,
@@ -2650,24 +2682,32 @@ class WebHandler:
                 "mobile_wallpaper_brightness",
                 "component_opacity",
             }
+            int_keys = {
+                "ip_rate_limit",
+                "code_expire_seconds",
+                "code_length",
+            }
             for key in allowed_keys:
                 if key in data:
                     if key in percent_keys:
                         update_data[key] = normalize_percent(data[key], 100)
+                    elif key in int_keys:
+                        update_data[key] = normalize_non_negative_int(data[key], 0)
                     else:
                         update_data[key] = data[key]
 
             if self.config_manager.update(update_data):
-                # 如果更新了IP速率限制，更新速率限制器
-                if "ip_rate_limit" in update_data:
-                    ip_rate_limit = update_data["ip_rate_limit"]
-                    if ip_rate_limit == 0:
-                        # 0表示无限制，设置一个很大的值
-                        self.verify_rate_limiter.update_params(max_attempts=999999)
-                    else:
-                        self.verify_rate_limiter.update_params(
-                            max_attempts=ip_rate_limit
-                        )
+                if "ip_rate_limit" in update_data or "cdn_ip_method" in update_data:
+                    ip_rate_limit = normalize_non_negative_int(
+                        update_data.get(
+                            "ip_rate_limit",
+                            self._get_web_config("ip_rate_limit", 0),
+                        ),
+                        0,
+                    )
+                    effective_limit = 999999 if ip_rate_limit == 0 else ip_rate_limit
+                    self.verify_rate_limiter.update_params(max_attempts=effective_limit)
+                    self.rate_limiter.update_params(max_attempts=max(5, effective_limit))
                     logger.info(f"IP速率限制已更新为: {ip_rate_limit}")
 
                 return web.json_response({"success": True, "message": "配置保存成功"})
@@ -3341,7 +3381,11 @@ class WebHandler:
         - 添加速率限制防止暴力破解
         """
         try:
-            ip = request.remote or ""
+            ip = (
+                self.plugin._get_client_ip(request)
+                if hasattr(self.plugin, "_get_client_ip")
+                else (request.remote or "")
+            )
 
             # 检查速率限制
             allowed, error_msg = await self.verify_rate_limiter.check_and_record_limit(
@@ -3523,7 +3567,7 @@ class WebHandler:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{escape_html(title)} - OIDC登录</title>
+    <title>{escape_html(title)} - AMiaoLoader登录</title>
     <link rel="icon" type="image/png" href="{favicon_url_safe}">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
@@ -3543,7 +3587,7 @@ class WebHandler:
         <div class="flex flex-col items-center text-center gap-5">
             <div class="text-[var(--theme-color)] bg-sky-50 rounded-3xl p-4">{icon_html}</div>
             <div>
-                <p class="text-sm font-semibold text-slate-400 mb-2">OIDC 授权请求未完成</p>
+                <p class="text-sm font-semibold text-slate-400 mb-2">AMiaoLoader 授权请求未完成</p>
                 <h1 class="text-3xl font-bold text-slate-900">{escape_html(title)}</h1>
             </div>
             <p class="text-base leading-7 text-slate-600">{escape_html(description)}</p>
@@ -3656,7 +3700,7 @@ class WebHandler:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OIDC登录插件 - 管理后台</title>
+    <title>AMiaoLoader登录插件 - 管理后台</title>
     <link rel="icon" type="image/png" href="{favicon_url_safe}">
     <script src="https://cdn.tailwindcss.com"></script>
     {custom_font_link}
@@ -3711,8 +3755,8 @@ class WebHandler:
                     {icon_html}
                 </div>
                 <div>
-                    <h1 class="text-xl font-bold text-slate-800">OIDC 管理后台</h1>
-                    <p class="text-xs text-slate-500 font-medium">让支持 OIDC 的程序支持 QQ 登录</p>
+                    <h1 class="text-xl font-bold text-slate-800">AMiaoLoader 管理后台</h1>
+                    <p class="text-xs text-slate-500 font-medium">让支持 AMiaoLoader 的程序支持 QQ 登录</p>
                 </div>
             </div>
             <button onclick="logout()" class="px-4 py-2 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-xl text-sm font-bold transition-all flex items-center gap-2">
@@ -3764,7 +3808,7 @@ class WebHandler:
                 <div class="bg-white rounded-3xl p-8 shadow-sm border border-slate-100">
                     <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
                         <span class="w-2 h-6 bg-primary rounded-full"></span>
-                        OIDC 端点
+                        AMiaoLoader 端点
                     </h2>
                     <div class="space-y-4">
                         <div class="p-4 bg-slate-50 rounded-2xl border border-slate-100">
@@ -4125,7 +4169,7 @@ class WebHandler:
 
                         <div class="md:col-span-2">
                             <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
-                            <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。留空使用全局设置"></textarea>
+                            <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已通过AMiaoLoader登录成功。留空使用全局设置"></textarea>
                             <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证成功消息</p>
                         </div>
 
@@ -5203,7 +5247,7 @@ class WebHandler:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OIDC 验证 - 验证码状态</title>
+    <title>AMiaoLoader 验证 - 验证码状态</title>
     <link rel="icon" type="image/png" href="{escape_html_attr(favicon_url)}">
     <script src="https://cdn.tailwindcss.com"></script>
     {custom_font_link}
@@ -5318,7 +5362,7 @@ class WebHandler:
 </html>"""
 
 
-@register("astrbot_plugin_chuyeoidc", "chuyegzs", "OIDC登录插件", "1.0.7")
+@register("astrbot_plugin_chuyeoidc", "chuyegzs", "AMiaoLoader登录插件", "1.0.7")
 class ChuyeOIDCPlugin(Star):
     """OIDC 登录插件主类
 
@@ -5359,37 +5403,56 @@ class ChuyeOIDCPlugin(Star):
         支持多种CDN服务商的IP获取方式。
         """
         cdn_ip_method = self._get_web_config("cdn_ip_method", "")
+        header_aliases = {
+            "HTTP_CF_CONNECTING_IP": "CF-Connecting-IP",
+            "HTTP_X_FORWARDED_FOR": "X-Forwarded-For",
+            "HTTP_X_REAL_IP": "X-Real-IP",
+            "HTTP_CLIENT_IP": "Client-IP",
+            "HTTP_X_FORWARDED": "X-Forwarded",
+            "HTTP_X_CLUSTER_CLIENT_IP": "X-Cluster-Client-IP",
+            "HTTP_FORWARDED_FOR": "Forwarded-For",
+            "HTTP_FORWARDED": "Forwarded",
+        }
 
-        # 如果配置了特定的CDN IP获取方式
         if cdn_ip_method:
-            header_value = request.headers.get(cdn_ip_method, "")
-            if header_value:
-                # 处理可能包含多个IP的情况（如 X-Forwarded-For: client, proxy1, proxy2）
-                ips = [ip.strip() for ip in header_value.split(",")]
-                return ips[0] if ips else request.remote or ""
+            header_names = [cdn_ip_method, header_aliases.get(cdn_ip_method, "")]
+            for header_name in header_names:
+                if not header_name:
+                    continue
+                header_value = request.headers.get(header_name, "")
+                if header_value:
+                    ips = [ip.strip() for ip in header_value.split(",") if ip.strip()]
+                    return ips[0] if ips else request.remote or ""
 
-        # 自动检测：按优先级尝试各种方式
         ip_headers = [
-            "HTTP_CF_CONNECTING_IP",  # Cloudflare
-            "HTTP_X_FORWARDED_FOR",  # 常见CDN/代理
-            "HTTP_X_REAL_IP",  # Nginx代理
-            "HTTP_CLIENT_IP",  # 一些代理
-            "HTTP_X_FORWARDED",  # 一些代理
-            "HTTP_X_CLUSTER_CLIENT_IP",  # 一些负载均衡
-            "HTTP_FORWARDED_FOR",  # 标准Forwarded头
-            "HTTP_FORWARDED",  # 标准Forwarded头
+            "CF-Connecting-IP",
+            "X-Forwarded-For",
+            "X-Real-IP",
+            "Client-IP",
+            "X-Forwarded",
+            "X-Cluster-Client-IP",
+            "Forwarded-For",
+            "Forwarded",
+            "HTTP_CF_CONNECTING_IP",
+            "HTTP_X_FORWARDED_FOR",
+            "HTTP_X_REAL_IP",
+            "HTTP_CLIENT_IP",
+            "HTTP_X_FORWARDED",
+            "HTTP_X_CLUSTER_CLIENT_IP",
+            "HTTP_FORWARDED_FOR",
+            "HTTP_FORWARDED",
         ]
 
         for header in ip_headers:
             header_value = request.headers.get(header, "")
             if header_value:
-                ips = [ip.strip() for ip in header_value.split(",")]
+                ips = [ip.strip() for ip in header_value.split(",") if ip.strip()]
                 return ips[0] if ips else ""
 
         return request.remote or ""
 
     async def initialize(self):
-        logger.info("OIDC登录插件正在初始化...")
+        logger.info("AMiaoLoader登录插件正在初始化...")
 
         self.config_manager = ConfigManager(self)
         self.client_manager = ClientManager()
@@ -5454,7 +5517,7 @@ class ChuyeOIDCPlugin(Star):
 
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
 
-        logger.info(f"OIDC登录插件初始化完成，服务端口: {port}")
+        logger.info(f"AMiaoLoader登录插件初始化完成，服务端口: {port}")
         logger.info(f"管理后台地址: http://localhost:{port}/{secure_path}")
         logger.info(
             f"OIDC发现文档: http://localhost:{port}/.well-known/openid-configuration"
@@ -5498,7 +5561,7 @@ class ChuyeOIDCPlugin(Star):
         self._web_app = None
 
     async def terminate(self):
-        logger.info("OIDC登录插件正在停止...")
+        logger.info("AMiaoLoader登录插件正在停止...")
 
         # 停止自动保存任务
         if self.oidc_server:
@@ -5517,7 +5580,7 @@ class ChuyeOIDCPlugin(Star):
             except Exception as e:
                 logger.warning(f"停止时保存会话数据失败，已继续关闭: {e}")
 
-        logger.info("OIDC登录插件已停止")
+        logger.info("AMiaoLoader登录插件已停止")
 
     async def _periodic_cleanup(self):
         """定期清理过期数据和密钥轮换
@@ -5642,7 +5705,7 @@ class ChuyeOIDCPlugin(Star):
             if custom_message:
                 yield event.plain_result(custom_message)
             else:
-                yield event.plain_result("验证成功！您已通过OIDC认证。")
+                yield event.plain_result("验证成功！您已通过AMiaoLoader登录成功。")
         else:
             yield event.plain_result(f"验证失败：{result}")
 
@@ -5775,4 +5838,4 @@ class ChuyeOIDCPlugin(Star):
             if custom_message:
                 yield event.plain_result(custom_message)
             else:
-                yield event.plain_result("验证成功！您已通过OIDC认证。")
+                yield event.plain_result("验证成功！您已通过AMiaoLoader登录成功。")
