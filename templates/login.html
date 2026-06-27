@@ -19,12 +19,12 @@
         }
     </script>
     <style>
-        html, body, button, input, select, textarea { font-family: {{custom_font_family}} !important; }
-        body::before { content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{{pc_wallpaper_url}}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({{pc_wallpaper_brightness}}%); }
+        html, body, button, input, select, textarea, code { font-family: {{custom_font_family}} !important; }
+        body::before { content: ''; position: fixed; inset: 0; z-index: -2; background-image: {{pc_wallpaper_url}}; background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({{pc_wallpaper_brightness}}%); }
         body::after { content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(224, 231, 255, 0.28), rgba(248, 250, 252, 0.08), rgba(204, 251, 241, 0.24)); pointer-events: none; }
         .glass { background: rgba(255, 255, 255, {{component_opacity}}); backdrop-filter: blur(18px); }
         @media (max-width: 768px) {
-            body::before { background-image: url('{{mobile_wallpaper_url}}'); filter: brightness({{mobile_wallpaper_brightness}}%); }
+            body::before { background-image: {{mobile_wallpaper_url}}; filter: brightness({{mobile_wallpaper_brightness}}%); }
         }
         .bg-primary { background-color: {{theme_color}}; }
         .text-primary { color: {{theme_color}}; }

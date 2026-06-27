@@ -14,7 +14,6 @@ import html
 import os
 import re
 from collections.abc import Callable
-from typing import Dict, Optional, Union
 
 
 def escape_html(text: str) -> str:
@@ -104,7 +103,7 @@ class TemplateManager:
     - 缓存机制提高性能
     """
 
-    def __init__(self, templates_dir: Optional[str] = None):
+    def __init__(self, templates_dir: str | None = None):
         """初始化模板管理器
 
         Args:
@@ -115,8 +114,8 @@ class TemplateManager:
         else:
             self.templates_dir = templates_dir
 
-        self._cache: Dict[str, str] = {}
-        self._escape_functions: Dict[str, Callable[[str], str]] = {
+        self._cache: dict[str, str] = {}
+        self._escape_functions: dict[str, Callable[[str], str]] = {
             "html": escape_html,
             "attr": escape_html_attr,
             "js": escape_js_string,
@@ -217,7 +216,7 @@ class TemplateManager:
         return result
 
     def render_with_escapes(
-        self, template_name: str, escape_map: Dict[str, str], **kwargs
+        self, template_name: str, escape_map: dict[str, str], **kwargs
     ) -> str:
         """使用指定转义模式渲染模板
 

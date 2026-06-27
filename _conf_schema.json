@@ -88,7 +88,7 @@
         "description": "登录锁定时间（分钟）",
         "type": "int",
         "hint": "超过最大尝试次数后的锁定时间",
-        "default": 15,
+        "default": 5,
         "minimum": 5,
         "maximum": 60
       }

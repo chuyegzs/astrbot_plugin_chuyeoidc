@@ -4,7 +4,7 @@ AstrBot AMiaoLoader 登录插件
 用于网站 AMiaoLoader 登录插件，让支持 AMiaoLoader 登录的程序支持 QQ 群聊/私聊登录。
 
 作者: 初叶🍂竹叶-Furry控
-版本: v1.1.4
+版本: v1.1.5
 """
 
 import asyncio
@@ -21,10 +21,10 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 
-import jwt
 import aiohttp
+import jwt
 from aiohttp import web
 
 from astrbot.api import logger
@@ -925,6 +925,9 @@ class ConfigManager:
             "component_opacity": 70,
             "default_group_hidden_message": "人数已满",
             "verify_success_message": "验证成功！您已通过AMiaoLoader登录成功。",
+            "enable_expired_code_notice": False,
+            "expired_code_notice_seconds": 60,
+            "expired_code_message": "验证码已过期，请返回登录页重新获取验证码。",
         }
 
         if os.path.exists(self.config_file):
@@ -1066,6 +1069,9 @@ class ClientManager:
         verify_group_id: str = "",
         verify_success_message: str = "",
         verify_groups: list = None,
+        enable_expired_code_notice: bool = None,
+        expired_code_notice_seconds: int = None,
+        expired_code_message: str = "",
     ) -> bool:
         if client_id in self._clients:
             return False
@@ -1096,6 +1102,9 @@ class ClientManager:
             "verify_group_id": verify_group_id,
             "verify_groups": verify_groups,
             "verify_success_message": verify_success_message,
+            "enable_expired_code_notice": enable_expired_code_notice,
+            "expired_code_notice_seconds": expired_code_notice_seconds,
+            "expired_code_message": expired_code_message,
             "created_at": time.time(),
         }
         return self._save_clients()
@@ -1113,6 +1122,9 @@ class ClientManager:
         verify_group_id: str = None,
         verify_success_message: str = None,
         verify_groups: list = None,
+        enable_expired_code_notice: bool = None,
+        expired_code_notice_seconds: int = None,
+        expired_code_message: str = None,
     ) -> bool:
         if client_id not in self._clients:
             return False
@@ -1130,6 +1142,12 @@ class ClientManager:
             self._clients[client_id]["verify_group_id"] = verify_group_id
         if verify_success_message is not None:
             self._clients[client_id]["verify_success_message"] = verify_success_message
+        if enable_expired_code_notice is not None:
+            self._clients[client_id]["enable_expired_code_notice"] = enable_expired_code_notice
+        if expired_code_notice_seconds is not None:
+            self._clients[client_id]["expired_code_notice_seconds"] = expired_code_notice_seconds
+        if expired_code_message is not None:
+            self._clients[client_id]["expired_code_message"] = expired_code_message
         if home_urls is not None:
             self._clients[client_id]["home_urls"] = home_urls
         if redirect_urls is not None:
@@ -1251,6 +1269,29 @@ class OIDCServer:
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode("utf-8")
+
+    def _get_expired_code_notice_config(self, client: dict = None) -> tuple[bool, int, str]:
+        global_enabled = self._get_web_config("enable_expired_code_notice", False)
+        global_seconds = normalize_non_negative_int(
+            self._get_web_config("expired_code_notice_seconds", 60), 60
+        )
+        global_message = self._get_web_config(
+            "expired_code_message", "验证码已过期，请返回登录页重新获取验证码。"
+        )
+        if not client:
+            return global_enabled, global_seconds, global_message
+        enabled = client.get("enable_expired_code_notice")
+        seconds = client.get("expired_code_notice_seconds")
+        message = client.get("expired_code_message", "")
+        if enabled is None:
+            enabled = global_enabled
+        if seconds is None:
+            seconds = global_seconds
+        else:
+            seconds = normalize_non_negative_int(seconds, global_seconds)
+        if not message:
+            message = global_message
+        return enabled, seconds, message
 
     def _get_jwks_keys(self) -> list[dict]:
         """获取 JWKS 格式的所有活跃公钥（不包含私钥信息）"""
@@ -1534,6 +1575,29 @@ class OIDCServer:
 
             return True, verify_code.session_id
 
+    async def get_expired_code_notice(self, code: str, client: dict = None) -> str:
+        expire_seconds = self._get_web_config("code_expire_seconds", 300)
+        async with self._lock:
+            verify_code_data = self.session_manager.get_verify_code(code)
+            if not verify_code_data or verify_code_data.get("used", False):
+                return ""
+            if time.time() - verify_code_data.get("created_at", 0) <= expire_seconds:
+                return ""
+            if client is None:
+                client_id = verify_code_data.get("client_id", "")
+                if client_id:
+                    client = self.client_manager.get_client(client_id)
+            enabled, notice_seconds, message = self._get_expired_code_notice_config(client)
+            if not enabled or notice_seconds <= 0:
+                return ""
+            if time.time() - verify_code_data.get("created_at", 0) > expire_seconds + notice_seconds:
+                return ""
+            if verify_code_data.get("expired_notice_sent", False):
+                return ""
+            verify_code_data["expired_notice_sent"] = True
+            self.session_manager.set_verify_code(code, verify_code_data)
+            return message
+
     async def get_session(self, session_id: str) -> AuthSession | None:
         # 使用类变量缓存上一次的 session_id 和日志时间，避免相同请求重复记录日志
         if not hasattr(self, "_last_logged_session_id"):
@@ -1727,11 +1791,19 @@ class OIDCServer:
         current_time = time.time()
 
         async with self._lock:
-            expired_codes = [
-                code
-                for code, vc in self.verify_codes.items()
-                if current_time - vc.get("created_at", 0) > expire_seconds
-            ]
+            expired_codes = []
+            for code, vc in self.verify_codes.items():
+                elapsed = current_time - vc.get("created_at", 0)
+                client = None
+                client_id = vc.get("client_id", "")
+                if client_id:
+                    client = self.client_manager.get_client(client_id)
+                notice_enabled, notice_seconds, _ = self._get_expired_code_notice_config(
+                    client
+                )
+                keep_seconds = expire_seconds + (notice_seconds if notice_enabled else 0)
+                if elapsed > keep_seconds:
+                    expired_codes.append(code)
             for code in expired_codes:
                 vc = self.session_manager.get_verify_code(code)
                 self.session_manager.delete_verify_code(code)
@@ -1779,7 +1851,7 @@ class RateLimiter:
     def __init__(
         self,
         max_attempts: int = 5,
-        lockout_duration: int = 900,
+        lockout_duration: int = 300,
         window_size: int = 300,
         on_rate_limit_triggered: callable = None,
     ):
@@ -1787,7 +1859,7 @@ class RateLimiter:
 
         Args:
             max_attempts: 最大尝试次数（默认5次）
-            lockout_duration: 锁定时间（秒，默认15分钟）
+            lockout_duration: 锁定时间（秒，默认5分钟）
             window_size: 时间窗口大小（秒，默认5分钟）
             on_rate_limit_triggered: 速率限制触发时的回调函数
         """
@@ -1947,6 +2019,43 @@ class RateLimiter:
             self._attempts[key].append(current_time)
             return True, ""
 
+    async def record_failure_and_check_limit(
+        self, identifier: str, ip: str = ""
+    ) -> tuple[bool, str]:
+        async with self._lock:
+            key = self._get_key(identifier, ip)
+            current_time = time.time()
+
+            if key in self._lockouts:
+                lockout_end = self._lockouts[key]
+                if current_time < lockout_end:
+                    remaining = int(lockout_end - current_time)
+                    return False, f"登录尝试次数过多，请 {remaining // 60} 分钟后再试"
+                del self._lockouts[key]
+                self._attempts.pop(key, None)
+
+            attempts = [
+                t
+                for t in self._attempts.get(key, [])
+                if current_time - t < self.window_size
+            ]
+            attempts.append(current_time)
+            self._attempts[key] = attempts
+
+            if len(attempts) >= self.max_attempts:
+                self._lockouts[key] = current_time + self.lockout_duration
+                if self.on_rate_limit_triggered:
+                    try:
+                        await self.on_rate_limit_triggered(identifier, ip, len(attempts))
+                    except Exception as e:
+                        logger.error(f"速率限制告警回调失败: {e}")
+                return (
+                    False,
+                    f"登录尝试次数过多，已锁定 {self.lockout_duration // 60} 分钟",
+                )
+
+            return True, ""
+
     async def reset_attempts(self, identifier: str, ip: str = ""):
         """重置尝试记录（登录成功时调用）"""
         async with self._lock:
@@ -2014,9 +2123,15 @@ class WebHandler:
 
         # 初始化速率限制器
         self.rate_limiter = RateLimiter(
-            max_attempts=max(5, effective_ip_rate_limit),
-            lockout_duration=900,  # 15分钟
-            window_size=60,  # 1分钟
+            max_attempts=5,
+            lockout_duration=300,
+            window_size=300,
+            on_rate_limit_triggered=on_rate_limit_triggered,
+        )
+        self.authorize_rate_limiter = RateLimiter(
+            max_attempts=effective_ip_rate_limit,
+            lockout_duration=300,
+            window_size=60,
             on_rate_limit_triggered=on_rate_limit_triggered,
         )
 
@@ -2110,6 +2225,20 @@ class WebHandler:
             .replace("\r", "")
         )
 
+    def _css_image_url(self, url: str) -> str:
+        return f"url('{self._css_url(url)}')" if url else "none"
+
+    def _font_family_from_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        family = parse_qs(parsed.query).get("family", [""])[0]
+        if not family:
+            return "'Custom Font', -apple-system, sans-serif"
+        family_name = unquote_plus(family).split(":", 1)[0].strip()
+        if not family_name:
+            return "'Custom Font', -apple-system, sans-serif"
+        family_name = family_name.replace("\\", "").replace("'", "")
+        return f"'{family_name}', 'Custom Font', -apple-system, sans-serif"
+
     def _get_custom_font_assets(self) -> tuple[str, str]:
         custom_font_url = self._get_web_config("custom_font_url", "")
         if not custom_font_url:
@@ -2120,7 +2249,7 @@ class WebHandler:
 
         parsed_path = urlparse(custom_font_url).path.lower()
         safe_url = escape_html_attr(custom_font_url)
-        font_family = "'Custom Font', -apple-system, sans-serif"
+        font_family = self._font_family_from_url(custom_font_url)
         font_formats = {
             ".woff2": "woff2",
             ".woff": "woff",
@@ -2130,7 +2259,7 @@ class WebHandler:
             if parsed_path.endswith(suffix):
                 css_url = self._css_url("/assets/custom-font")
                 return (
-                    f"<style>@font-face {{ font-family: 'Custom Font'; src: url('{css_url}') format('{font_format}'); font-weight: normal; font-style: normal; font-display: swap; }} html, body, button, input, select, textarea {{ font-family: 'Custom Font', -apple-system, sans-serif !important; }}</style>",
+                    f"<style>@font-face {{ font-family: 'Custom Font'; src: url('{css_url}') format('{font_format}'), url('{safe_url}') format('{font_format}'); font-weight: normal; font-style: normal; font-display: swap; }} html, body, button, input, select, textarea, code {{ font-family: 'Custom Font', -apple-system, sans-serif !important; }}</style>",
                     font_family,
                 )
 
@@ -2149,8 +2278,8 @@ class WebHandler:
             self._get_web_config("component_opacity", 70), 70
         )
         return {
-            "pc_wallpaper_url": self._css_url(pc_url),
-            "mobile_wallpaper_url": self._css_url(mobile_url or pc_url),
+            "pc_wallpaper_url": self._css_image_url(pc_url),
+            "mobile_wallpaper_url": self._css_image_url(mobile_url or pc_url),
             "pc_wallpaper_brightness": pc_brightness,
             "mobile_wallpaper_brightness": mobile_brightness,
             "component_opacity": component_opacity / 100,
@@ -2426,14 +2555,15 @@ class WebHandler:
                 else (request.remote or "")
             )
 
-            # 原子性地检查速率限制并记录尝试
-            allowed, error_msg = await self.rate_limiter.check_and_record_limit(
-                username, ip
-            )
-            if not allowed:
+            attempts_info = self.rate_limiter.get_attempts_info(username, ip)
+            if attempts_info["is_locked"]:
+                remaining = attempts_info["lockout_remaining"]
                 return web.json_response(
-                    {"success": False, "message": error_msg},
-                    status=429,  # Too Many Requests
+                    {
+                        "success": False,
+                        "message": f"登录尝试次数过多，请 {remaining // 60} 分钟后再试",
+                    },
+                    status=429,
                 )
 
             if self._check_password_default():
@@ -2447,13 +2577,18 @@ class WebHandler:
                 )
 
             if self._verify_login(username, password):
-                # 登录成功，重置尝试记录
-                await self.rate_limiter.reset_attempts(username, ip)
                 token = self._generate_session_token()
                 self.sessions[token] = {"username": username, "created_at": time.time()}
                 return web.json_response({"success": True, "token": token})
             else:
-                # 登录失败，获取剩余尝试次数
+                allowed, error_msg = await self.rate_limiter.record_failure_and_check_limit(
+                    username, ip
+                )
+                if not allowed:
+                    return web.json_response(
+                        {"success": False, "message": error_msg}, status=429
+                    )
+
                 attempts_info = self.rate_limiter.get_attempts_info(username, ip)
                 remaining = max(
                     0, attempts_info["max_attempts"] - attempts_info["attempts_count"]
@@ -2543,6 +2678,15 @@ class WebHandler:
             "verify_success_message": self._get_web_config(
                 "verify_success_message", "验证成功！您已通过AMiaoLoader登录成功。"
             ),
+            "enable_expired_code_notice": self._get_web_config(
+                "enable_expired_code_notice", False
+            ),
+            "expired_code_notice_seconds": self._get_web_config(
+                "expired_code_notice_seconds", 60
+            ),
+            "expired_code_message": self._get_web_config(
+                "expired_code_message", "验证码已过期，请返回登录页重新获取验证码。"
+            ),
             "theme_color": self._get_web_config("theme_color", "#50b6fe"),
             "icon_url": self._get_web_config("icon_url", ""),
             "favicon_url": self._get_web_config("favicon_url", ""),
@@ -2600,6 +2744,17 @@ class WebHandler:
                 if not isinstance(value, int) or value < 4 or value > 10:
                     return web.json_response(
                         {"success": False, "message": "验证码长度必须在 4-10 位之间"},
+                        status=400,
+                    )
+
+            if "expired_code_notice_seconds" in data:
+                value = data["expired_code_notice_seconds"]
+                if not isinstance(value, int) or value < 0 or value > 3600:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "message": "验证码失效提醒时间必须在 0-3600 秒之间",
+                        },
                         status=400,
                     )
 
@@ -2662,6 +2817,9 @@ class WebHandler:
                 "code_length",
                 "ip_rate_limit",
                 "verify_success_message",
+                "enable_expired_code_notice",
+                "expired_code_notice_seconds",
+                "expired_code_message",
                 "theme_color",
                 "icon_url",
                 "favicon_url",
@@ -2686,6 +2844,7 @@ class WebHandler:
                 "ip_rate_limit",
                 "code_expire_seconds",
                 "code_length",
+                "expired_code_notice_seconds",
             }
             for key in allowed_keys:
                 if key in data:
@@ -2707,7 +2866,7 @@ class WebHandler:
                     )
                     effective_limit = 999999 if ip_rate_limit == 0 else ip_rate_limit
                     self.verify_rate_limiter.update_params(max_attempts=effective_limit)
-                    self.rate_limiter.update_params(max_attempts=max(5, effective_limit))
+                    self.authorize_rate_limiter.update_params(max_attempts=effective_limit)
                     logger.info(f"IP速率限制已更新为: {ip_rate_limit}")
 
                 return web.json_response({"success": True, "message": "配置保存成功"})
@@ -2810,6 +2969,15 @@ class WebHandler:
                         "verify_success_message": client_data.get(
                             "verify_success_message", ""
                         ),
+                        "enable_expired_code_notice": client_data.get(
+                            "enable_expired_code_notice"
+                        ),
+                        "expired_code_notice_seconds": client_data.get(
+                            "expired_code_notice_seconds"
+                        ),
+                        "expired_code_message": client_data.get(
+                            "expired_code_message", ""
+                        ),
                         "home_urls": home_urls,
                         "redirect_urls": redirect_urls,
                         "created_at": client_data.get("created_at", 0),
@@ -2840,6 +3008,15 @@ class WebHandler:
             enable_private_verify = data.get("enable_private_verify", True)
             verify_group_id = data.get("verify_group_id", "")
             verify_success_message = data.get("verify_success_message", "")
+            enable_expired_code_notice = data.get(
+                "enable_expired_code_notice",
+                self._get_web_config("enable_expired_code_notice", False),
+            )
+            expired_code_notice_seconds = data.get(
+                "expired_code_notice_seconds",
+                self._get_web_config("expired_code_notice_seconds", 60),
+            )
+            expired_code_message = data.get("expired_code_message", "")
             verify_groups = normalize_verify_groups(data.get("verify_groups", []))
             home_urls = data.get("home_urls", [])
             redirect_urls = data.get("redirect_urls", [])
@@ -2855,6 +3032,22 @@ class WebHandler:
                 home_urls = [data.get("home_url")]
             if not redirect_urls and data.get("redirect_url"):
                 redirect_urls = [data.get("redirect_url")]
+
+            if expired_code_notice_seconds is not None:
+                try:
+                    expired_code_notice_seconds = int(expired_code_notice_seconds)
+                except (TypeError, ValueError):
+                    return web.json_response(
+                        {"success": False, "message": "提醒时间必须是数字"}, status=400
+                    )
+                if expired_code_notice_seconds < 0 or expired_code_notice_seconds > 3600:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "message": "验证码失效提醒时间必须在 0-3600 秒之间",
+                        },
+                        status=400,
+                    )
 
             if verify_groups:
                 verify_group_id = ",".join(
@@ -2873,6 +3066,9 @@ class WebHandler:
                 verify_group_id,
                 verify_success_message,
                 verify_groups,
+                enable_expired_code_notice,
+                expired_code_notice_seconds,
+                expired_code_message,
             ):
                 return web.json_response(
                     {
@@ -2888,6 +3084,9 @@ class WebHandler:
                             "verify_group_id": verify_group_id,
                             "verify_groups": verify_groups,
                             "verify_success_message": verify_success_message,
+                            "enable_expired_code_notice": enable_expired_code_notice,
+                            "expired_code_notice_seconds": expired_code_notice_seconds,
+                            "expired_code_message": expired_code_message,
                             "home_urls": home_urls,
                             "redirect_urls": redirect_urls,
                         },
@@ -2920,6 +3119,24 @@ class WebHandler:
             enable_private_verify = data.get("enable_private_verify")
             verify_group_id = data.get("verify_group_id")
             verify_success_message = data.get("verify_success_message")
+            enable_expired_code_notice = data.get("enable_expired_code_notice")
+            expired_code_notice_seconds = data.get("expired_code_notice_seconds")
+            expired_code_message = data.get("expired_code_message")
+            if expired_code_notice_seconds is not None:
+                try:
+                    expired_code_notice_seconds = int(expired_code_notice_seconds)
+                except (TypeError, ValueError):
+                    return web.json_response(
+                        {"success": False, "message": "提醒时间必须是数字"}, status=400
+                    )
+                if expired_code_notice_seconds < 0 or expired_code_notice_seconds > 3600:
+                    return web.json_response(
+                        {
+                            "success": False,
+                            "message": "验证码失效提醒时间必须在 0-3600 秒之间",
+                        },
+                        status=400,
+                    )
             verify_groups = (
                 normalize_verify_groups(data.get("verify_groups"))
                 if data.get("verify_groups") is not None
@@ -2950,6 +3167,9 @@ class WebHandler:
                 verify_group_id,
                 verify_success_message,
                 verify_groups,
+                enable_expired_code_notice,
+                expired_code_notice_seconds,
+                expired_code_message,
             ):
                 return web.json_response(
                     {
@@ -3012,7 +3232,7 @@ class WebHandler:
         """
         # 速率限制检查
         ip = request.remote or ""
-        allowed, error_msg = await self.rate_limiter.check_and_record_limit(
+        allowed, error_msg = await self.authorize_rate_limiter.check_and_record_limit(
             f"authorize:{ip}", ip
         )
         if not allowed:
@@ -3573,11 +3793,11 @@ class WebHandler:
     <style>
         :root {{ --theme-color: {theme_color_css}; }}
         body {{ background: #f8fafc; }}
-        body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{pc_wallpaper_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
+        body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: {pc_wallpaper_url}; background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
         body::after {{ content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(240, 249, 255, 0.24), rgba(255, 255, 255, 0.08), rgba(238, 248, 255, 0.2)); pointer-events: none; }}
         .glass-panel {{ background: rgba(255, 255, 255, {component_opacity}); backdrop-filter: blur(18px); }}
         @media (max-width: 768px) {{
-            body::before {{ background-image: url('{mobile_wallpaper_url}'); filter: brightness({mobile_wallpaper_brightness}%); }}
+            body::before {{ background-image: {mobile_wallpaper_url}; filter: brightness({mobile_wallpaper_brightness}%); }}
         }}
     </style>
 </head>
@@ -3717,9 +3937,9 @@ class WebHandler:
     </script>
     <style>
         html {{ overflow-y: scroll; scrollbar-gutter: stable; }}
-        html, body, button, input, select, textarea {{ font-family: {custom_font_family} !important; }}
+        html, body, button, input, select, textarea, code {{ font-family: {custom_font_family} !important; }}
         body {{ overflow-x: hidden; }}
-        body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{pc_wallpaper_url}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
+        body::before {{ content: ''; position: fixed; inset: 0; z-index: -2; background-image: {pc_wallpaper_url}; background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({pc_wallpaper_brightness}%); }}
         body::after {{ content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(238, 242, 255, 0.22), rgba(248, 250, 252, 0.08), rgba(240, 253, 250, 0.18)); pointer-events: none; }}
         .glass {{ background: rgba(255, 255, 255, {component_opacity}); backdrop-filter: blur(18px); }}
         .bg-white {{ background-color: rgba(255, 255, 255, {component_opacity}) !important; backdrop-filter: blur(18px); }}
@@ -3742,7 +3962,7 @@ class WebHandler:
         .tab-content.tab-content-left {{ transform: translateX(-18px); }}
         .tab-content.tab-content-active {{ opacity: 1; transform: translateX(0); }}
         @media (max-width: 768px) {{
-            body::before {{ background-image: url('{mobile_wallpaper_url}'); filter: brightness({mobile_wallpaper_brightness}%); }}
+            body::before {{ background-image: {mobile_wallpaper_url}; filter: brightness({mobile_wallpaper_brightness}%); }}
             .mobile-scale {{ transform: scale(0.95); transform-origin: top center; }}
         }}
     </style>
@@ -4021,12 +4241,31 @@ class WebHandler:
                                 </label>
                             </div>
 
-                            <!-- 自定义验证成功消息 -->
-                            <div class="pt-4 border-t border-slate-100">
-                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
-                                <textarea id="verifySuccessMessage" rows="3" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。"></textarea>
-                                <p class="text-xs text-slate-500 mt-2">用户验证成功后发送的自定义消息，留空使用默认消息</p>
+                            <div class="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                                <div>
+                                    <p class="text-sm font-bold text-slate-700">验证码失效提示</p>
+                                    <p class="text-xs text-slate-500">验证码过期后指定时间内发送旧验证码时仅提醒一次</p>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="enableExpiredCodeNotice" class="sr-only peer">
+                                    <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
+                                </label>
                             </div>
+
+                            <!-- 验证回复消息 -->
+                            <div class="pt-4 border-t border-slate-100 grid md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
+                                    <textarea id="verifySuccessMessage" rows="3" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已成功登录。"></textarea>
+                                    <p class="text-xs text-slate-500 mt-2">用户验证成功后发送的自定义消息，留空使用默认消息</p>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证码失效信息</label>
+                                    <textarea id="expiredCodeMessage" rows="3" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证码已过期，请返回登录页重新获取验证码。"></textarea>
+                                    <p class="text-xs text-slate-500 mt-2">启用验证码失效提示后，旧验证码命中时发送此消息</p>
+                                </div>
+                            </div>
+
                         </div>
                     </div>
 
@@ -4056,6 +4295,12 @@ class WebHandler:
                                 <input type="number" id="ipRateLimit" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" step="1">
                                 <p class="text-xs text-slate-500 mt-2">每个IP每分钟最多请求次数，0为无限制；启用限制时请填写 30 或更大数值</p>
                             </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">失效后提示窗口 (秒)</label>
+                                <input type="number" id="expiredCodeNoticeSeconds" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" max="3600" step="1">
+                                <p class="text-xs text-slate-500 mt-2">验证码过期后的可提醒窗口，0 表示不保留提醒窗口</p>
+                            </div>
+
                         </div>
                     </div>
                 </div>
@@ -4149,6 +4394,18 @@ class WebHandler:
                                         <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
                                     </label>
                                 </div>
+                                <div class="md:col-span-2 flex items-center gap-4 p-4 bg-slate-50 rounded-2xl">
+                                    <div class="flex-1 min-w-0">
+                                        <p class="text-sm font-bold text-slate-700">验证码失效提示</p>
+                                        <p class="text-xs text-slate-500">留空状态跟随全局设置，编辑时可单独覆盖</p>
+                                    </div>
+                                    <label class="text-sm font-bold text-slate-700 whitespace-nowrap">失效后提示窗口 (秒)</label>
+                                    <input type="number" id="clientExpiredCodeNoticeSeconds" class="w-36 px-4 py-2 bg-white border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none" min="0" max="3600" step="1" placeholder="全局">
+                                    <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                                        <input type="checkbox" id="clientEnableExpiredCodeNotice" class="sr-only peer">
+                                        <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
+                                    </label>
+                                </div>
                             </div>
                         </div>
 
@@ -4167,11 +4424,20 @@ class WebHandler:
                             <p class="text-xs text-slate-500 mt-3">添加接收验证码的群聊，可单独设置是否隐藏群号或将群号替换为指定文字</p>
                         </div>
 
-                        <div class="md:col-span-2">
-                            <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
-                            <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已通过AMiaoLoader登录成功。留空使用全局设置"></textarea>
-                            <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证成功消息</p>
+
+                        <div class="md:col-span-2 grid md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证成功消息</label>
+                                <textarea id="clientVerifySuccessMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证成功！您已通过AMiaoLoader登录成功。留空使用全局设置"></textarea>
+                                <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证成功消息</p>
+                            </div>
+                            <div>
+                                <label class="block text-sm font-bold text-slate-700 mb-2">自定义验证码失效信息</label>
+                                <textarea id="clientExpiredCodeMessage" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-2xl focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all outline-none resize-none" placeholder="验证码已过期，请重新获取。留空使用全局设置"></textarea>
+                                <p class="text-xs text-slate-500 mt-2">留空则使用全局设置的验证码失效信息</p>
+                            </div>
                         </div>
+
 
                         <div class="grid md:grid-cols-2 gap-4 md:col-span-2">
                             <div>
@@ -4349,6 +4615,9 @@ class WebHandler:
                 document.getElementById('verifyGroupId').value = config.verify_group_id || '';
                 document.getElementById('defaultGroupHiddenMessage').value = config.default_group_hidden_message || '人数已满';
                 document.getElementById('verifySuccessMessage').value = config.verify_success_message || '';
+                document.getElementById('enableExpiredCodeNotice').checked = config.enable_expired_code_notice === true;
+                document.getElementById('expiredCodeNoticeSeconds').value = config.expired_code_notice_seconds ?? 60;
+                document.getElementById('expiredCodeMessage').value = config.expired_code_message || '';
 
                 const themeColor = config.theme_color || '#50b6fe';
                 document.getElementById('themeColor').value = themeColor;
@@ -4426,6 +4695,9 @@ class WebHandler:
                 verify_group_id: document.getElementById('verifyGroupId').value,
                 default_group_hidden_message: document.getElementById('defaultGroupHiddenMessage').value,
                 verify_success_message: document.getElementById('verifySuccessMessage').value,
+                enable_expired_code_notice: document.getElementById('enableExpiredCodeNotice').checked,
+                expired_code_notice_seconds: parseInt(document.getElementById('expiredCodeNoticeSeconds').value),
+                expired_code_message: document.getElementById('expiredCodeMessage').value,
                 theme_color: document.getElementById('themeColor').value,
                 icon_url: document.getElementById('iconUrl').value,
                 favicon_url: document.getElementById('faviconUrl').value,
@@ -4590,7 +4862,7 @@ class WebHandler:
                         <td class="px-6 py-4 text-sm text-slate-400 font-medium">${{new Date(c.created_at * 1000).toLocaleString()}}</td>
                         <td class="px-6 py-4">
                             <div class="flex items-center gap-2">
-                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.enable_group_verify)}}, ${{JSON.stringify(c.enable_private_verify)}}, ${{JSON.stringify(c.verify_group_id || '')}}, ${{JSON.stringify(c.verify_success_message || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}}, ${{JSON.stringify(c.verify_groups || [])}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
+                                <button onclick='editClient(${{JSON.stringify(c.client_id)}}, ${{JSON.stringify(c.name)}}, ${{JSON.stringify(c.client_secret)}}, ${{JSON.stringify(c.icon_url || '')}}, ${{JSON.stringify(c.enable_group_verify)}}, ${{JSON.stringify(c.enable_private_verify)}}, ${{JSON.stringify(c.verify_group_id || '')}}, ${{JSON.stringify(c.verify_success_message || '')}}, ${{JSON.stringify(c.home_urls || [])}}, ${{JSON.stringify(c.redirect_urls || [])}}, ${{JSON.stringify(c.verify_groups || [])}}, ${{JSON.stringify(c.enable_expired_code_notice)}}, ${{JSON.stringify(c.expired_code_notice_seconds)}}, ${{JSON.stringify(c.expired_code_message || '')}})' class="px-3 py-1.5 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold transition-all">编辑</button>
                                 <button onclick="deleteClient(${{JSON.stringify(c.client_id)}})" class="px-3 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 rounded-lg text-xs font-bold transition-all">删除</button>
                             </div>
                         </td>
@@ -4661,6 +4933,9 @@ class WebHandler:
             document.getElementById('clientEnableGroupVerify').checked = true;
             document.getElementById('clientEnablePrivateVerify').checked = true;
             document.getElementById('clientVerifySuccessMessage').value = '';
+            document.getElementById('clientEnableExpiredCodeNotice').checked = document.getElementById('enableExpiredCodeNotice').checked;
+            document.getElementById('clientExpiredCodeNoticeSeconds').value = '';
+            document.getElementById('clientExpiredCodeMessage').value = '';
             document.getElementById('verifyGroupsContainer').innerHTML = '';
             document.getElementById('homeUrlsContainer').innerHTML = `
                 <div class="flex items-center gap-2">
@@ -4762,7 +5037,7 @@ class WebHandler:
             }}).filter(g => g.group_id);
         }}
 
-        function editClient(clientId, name, clientSecret, iconUrl, enableGroupVerify, enablePrivateVerify, verifyGroupId, verifySuccessMessage, homeUrls, redirectUrls, verifyGroups) {{
+        function editClient(clientId, name, clientSecret, iconUrl, enableGroupVerify, enablePrivateVerify, verifyGroupId, verifySuccessMessage, homeUrls, redirectUrls, verifyGroups, enableExpiredCodeNotice, expiredCodeNoticeSeconds, expiredCodeMessage) {{
             editingClientId = clientId;
             document.getElementById('newClientName').value = name || '';
             document.getElementById('newClientId').value = clientId || '';
@@ -4771,6 +5046,9 @@ class WebHandler:
             document.getElementById('clientEnableGroupVerify').checked = enableGroupVerify !== false;
             document.getElementById('clientEnablePrivateVerify').checked = enablePrivateVerify !== false;
             document.getElementById('clientVerifySuccessMessage').value = verifySuccessMessage || '';
+            document.getElementById('clientEnableExpiredCodeNotice').checked = enableExpiredCodeNotice === true;
+            document.getElementById('clientExpiredCodeNoticeSeconds').value = expiredCodeNoticeSeconds ?? '';
+            document.getElementById('clientExpiredCodeMessage').value = expiredCodeMessage || '';
 
             // 设置群聊列表
             const groupsContainer = document.getElementById('verifyGroupsContainer');
@@ -4817,6 +5095,10 @@ class WebHandler:
             const enable_group_verify = document.getElementById('clientEnableGroupVerify').checked;
             const enable_private_verify = document.getElementById('clientEnablePrivateVerify').checked;
             const verify_success_message = document.getElementById('clientVerifySuccessMessage').value;
+            const enable_expired_code_notice = document.getElementById('clientEnableExpiredCodeNotice').checked;
+            const expired_code_notice_seconds_value = document.getElementById('clientExpiredCodeNoticeSeconds').value;
+            const expired_code_notice_seconds = expired_code_notice_seconds_value === '' ? null : parseInt(expired_code_notice_seconds_value);
+            const expired_code_message = document.getElementById('clientExpiredCodeMessage').value;
             const verify_groups = getVerifyGroups();
             const verify_group_id = verify_groups.map(g => g.group_id).join(',');
             const home_urls = getHomeUrls();
@@ -4853,6 +5135,9 @@ class WebHandler:
                         verify_group_id: verify_group_id,
                         verify_groups: verify_groups,
                         verify_success_message: verify_success_message,
+                        enable_expired_code_notice: enable_expired_code_notice,
+                        expired_code_notice_seconds: expired_code_notice_seconds,
+                        expired_code_message: expired_code_message,
                         home_urls: home_urls,
                         redirect_urls: redirect_urls
                     }})
@@ -4980,6 +5265,15 @@ class WebHandler:
         # 优先使用客户端设置的图标URL，如果没有则使用全局图标URL
         client_icon_url = client.get("icon_url", "") if client else ""
         final_icon_url = client_icon_url if client_icon_url else icon_url
+        code_expire_seconds = normalize_non_negative_int(
+            self._get_web_config("code_expire_seconds", 300), 300
+        )
+        verify_code_data_for_countdown = (
+            self.oidc_server.session_manager.get_verify_code(code) or {}
+        )
+        code_created_at = int(
+            verify_code_data_for_countdown.get("created_at", time.time()) * 1000
+        )
 
         # 对 icon_url 进行 HTML 属性转义，防止 XSS 攻击
         icon_html = (
@@ -5099,6 +5393,8 @@ class WebHandler:
                 favicon_url=escape_html(favicon_url),
                 code=escape_html(code),
                 code_chars_html=code_chars_html,
+                code_expire_seconds=code_expire_seconds,
+                code_created_at=code_created_at,
                 session_id=escape_html(session_id),
                 auth_code=escape_html(auth_code),
                 redirect_uri=escape_html(redirect_uri),
@@ -5119,6 +5415,8 @@ class WebHandler:
                 favicon_url,
                 code,
                 code_chars_html,
+                code_expire_seconds,
+                code_created_at,
                 session_id,
                 auth_code,
                 redirect_uri,
@@ -5139,6 +5437,8 @@ class WebHandler:
         favicon_url: str,
         code: str,
         code_chars_html: str,
+        code_expire_seconds: int,
+        code_created_at: int,
         session_id: str,
         auth_code: str,
         redirect_uri: str,
@@ -5169,6 +5469,8 @@ class WebHandler:
                 favicon_url=escape_html_attr(favicon_url),
                 code=escape_html(code),
                 code_chars_html=code_chars_html,
+                code_expire_seconds=code_expire_seconds,
+                code_created_at=code_created_at,
                 session_id=escape_html(session_id),
                 auth_code=escape_html(auth_code),
                 redirect_uri=escape_html(redirect_uri),
@@ -5707,7 +6009,11 @@ class ChuyeOIDCPlugin(Star):
             else:
                 yield event.plain_result("验证成功！您已通过AMiaoLoader登录成功。")
         else:
-            yield event.plain_result(f"验证失败：{result}")
+            expired_notice = await self.oidc_server.get_expired_code_notice(code, client)
+            if expired_notice:
+                yield event.plain_result(expired_notice)
+            else:
+                yield event.plain_result(f"验证失败：{result}")
 
     @filter.regex(r"^\d{4,8}$")
     async def verify_code_direct(self, event: AstrMessageEvent):
@@ -5747,7 +6053,13 @@ class ChuyeOIDCPlugin(Star):
         expire_seconds = self._get_web_config("code_expire_seconds", 300)
         if time.time() - verify_code_data.get("created_at", 0) > expire_seconds:
             logger.warning(f"验证码已过期: {code}")
-            # 验证码已过期，静默处理
+            client = None
+            client_id = verify_code_data.get("client_id", "")
+            if client_id:
+                client = self.client_manager.get_client(client_id)
+            expired_notice = await self.oidc_server.get_expired_code_notice(code, client)
+            if expired_notice:
+                yield event.plain_result(expired_notice)
             return
 
         # 检查群聊限制

@@ -19,14 +19,15 @@
         }
     </script>
     <style>
-        html, body, button, input, select, textarea { font-family: {{custom_font_family}} !important; }
-        body::before { content: ''; position: fixed; inset: 0; z-index: -2; background-image: url('{{pc_wallpaper_url}}'); background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({{pc_wallpaper_brightness}}%); }
+        html, body, button, input, select, textarea, code { font-family: {{custom_font_family}} !important; }
+        body::before { content: ''; position: fixed; inset: 0; z-index: -2; background-image: {{pc_wallpaper_url}}; background-size: cover; background-position: center; background-repeat: no-repeat; filter: brightness({{pc_wallpaper_brightness}}%); }
         body::after { content: ''; position: fixed; inset: 0; z-index: -1; background: linear-gradient(135deg, rgba(224, 231, 255, 0.22), rgba(248, 250, 252, 0.06), rgba(204, 251, 241, 0.2)); pointer-events: none; }
         .glass { background: rgba(255, 255, 255, {{component_opacity}}); backdrop-filter: blur(18px); }
         @media (max-width: 768px) {
-            body::before { background-image: url('{{mobile_wallpaper_url}}'); filter: brightness({{mobile_wallpaper_brightness}}%); }
+            body::before { background-image: {{mobile_wallpaper_url}}; filter: brightness({{mobile_wallpaper_brightness}}%); }
         }
         .code-char { display: inline-block; width: 3rem; height: 4rem; line-height: 4rem; background: white; border-radius: 1rem; margin: 0 0.25rem; font-size: 2rem; font-weight: 800; color: {{theme_color}}; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .service-info a { font-family: inherit !important; }
         .bg-primary { background-color: {{theme_color}}; }
         .text-primary { color: {{theme_color}}; }
         .border-primary { border-color: {{theme_color}}; }
@@ -111,16 +112,24 @@
                         <div class="flex justify-center relative z-10">
                             {{code_chars_html}}
                         </div>
-                        <button type="button" id="copyCodeBtn" onclick="copyVerifyCode()" class="mt-4 inline-flex items-center justify-center gap-2 px-4 py-2 bg-white/20 hover:bg-white/30 text-white rounded-2xl text-sm font-bold transition-all relative z-10 border border-white/20">
-                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                            </svg>
-                            <span id="copyCodeText">复制验证码</span>
-                        </button>
+                        <div class="mt-4 inline-flex items-center justify-center gap-2 relative z-10">
+                            <span id="codeCountdown" class="inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-white/15 text-white rounded-2xl text-sm font-bold border border-white/20">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                                <span id="codeCountdownText">--:--</span>
+                            </span>
+                            <button type="button" id="copyCodeBtn" onclick="copyVerifyCode()" class="inline-flex items-center justify-center gap-2 px-4 py-2 bg-white/20 hover:bg-white/30 text-white rounded-2xl text-sm font-bold transition-all border border-white/20">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                                </svg>
+                                <span id="copyCodeText">复制验证码</span>
+                            </button>
+                        </div>
                     </div>
 
                     <!-- 验证码下方的验证方式说明 -->
-                    <div class="space-y-3 mb-6 text-left">
+                    <div class="space-y-3 mb-6 text-left service-info">
                         {{group_info}}
                         {{private_info}}
                     </div>
@@ -165,7 +174,43 @@
         var redirected = false;
         var lastClickTime = 0;
         var CLICK_INTERVAL = 2000;
+        var codeExpireSeconds = {{code_expire_seconds}};
+        var codeCreatedAt = {{code_created_at}};
+        var countdownTimer = null;
         var waitRetryTimer = null;
+
+        function formatCountdown(seconds) {
+            var safeSeconds = Math.max(0, seconds);
+            var minutes = Math.floor(safeSeconds / 60);
+            var restSeconds = safeSeconds % 60;
+            return String(minutes).padStart(2, '0') + ':' + String(restSeconds).padStart(2, '0');
+        }
+
+        function updateCodeCountdown() {
+            var countdownEl = document.getElementById('codeCountdown');
+            var countdownTextEl = document.getElementById('codeCountdownText');
+            var copyBtn = document.getElementById('copyCodeBtn');
+            var copyText = document.getElementById('copyCodeText');
+            if (!countdownEl || !countdownTextEl) return;
+            var expiresAt = codeCreatedAt + codeExpireSeconds * 1000;
+            var remaining = Math.ceil((expiresAt - Date.now()) / 1000);
+            countdownTextEl.textContent = formatCountdown(remaining);
+            if (remaining <= 0) {
+                countdownTextEl.textContent = '已过期';
+                countdownEl.classList.add('bg-rose-500/30');
+                if (copyBtn) {
+                    copyBtn.disabled = true;
+                    copyBtn.classList.add('opacity-60', 'cursor-not-allowed');
+                }
+                if (copyText) copyText.textContent = '验证码失效';
+                if (countdownTimer) clearInterval(countdownTimer);
+            }
+        }
+
+        function startCodeCountdown() {
+            updateCodeCountdown();
+            countdownTimer = setInterval(updateCodeCountdown, 1000);
+        }
         
         function copyVerifyCode() {
             var textEl = document.getElementById('copyCodeText');
@@ -213,6 +258,7 @@
         function updateUIForVerified() {
             if (isVerified) return;
             isVerified = true;
+            if (countdownTimer) clearInterval(countdownTimer);
 
             var statusEl = document.getElementById('status');
             var successStatusEl = document.getElementById('successStatus');
@@ -327,6 +373,7 @@
             );
         }
         
+        startCodeCountdown();
         waitForVerification();
     </script>
 </body>
